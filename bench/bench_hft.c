@@ -124,19 +124,28 @@ static void row(const char* name, double hot, double cpp, double cppt, double rs
            cpp / hot, cppt / hot, rs / hot, zig / hot, zigt / hot);
 }
 
+// Warm up cache / branch predictor / CPU clock before timing, so the first
+// kernel measured isn't penalized for a cold start (this made `dot` — the
+// first row — look ~2x slow on single-shot runs). Applied identically to
+// every contender, so it changes no ratio, only removes the artifact.
+#define WARMUP(body) do { for (long i = 0; i < (n >> 3) + 1; i++) { body } } while (0)
+
 static double bench_dot(dot_fn volatile f, const double* x, const double* y, long n) {
+    WARMUP( gsink += f(x, y); );
     double t0 = now_ns();
     for (long i = 0; i < n; i++) gsink += f(x, y);
     return (now_ns() - t0) / (double)n;
 }
 
 static double bench_scale(scale_fn volatile f, long n) {
+    WARMUP( gsink += f(A, 1.0 + (double)(i & 15) * 1e-6, OUT); );
     double t0 = now_ns();
     for (long i = 0; i < n; i++) gsink += f(A, 1.0 + (double)(i & 15) * 1e-6, OUT);
     return (now_ns() - t0) / (double)n;
 }
 
 static double bench_matvec(matvec_fn volatile f, long n) {
+    WARMUP( gsink += f(M, V, MV); );
     double t0 = now_ns();
     for (long i = 0; i < n; i++) gsink += f(M, V, MV);
     return (now_ns() - t0) / (double)n;
@@ -148,6 +157,7 @@ static double bench_matvec(matvec_fn volatile f, long n) {
 // select (predictable branches cost ~0; the select always pays both arms).
 // Real market data is less predictable; this row is a floor, not a win.
 static double bench_decide(decide_fn volatile f, long n) {
+    WARMUP( double p = (double)(i & 1023) / 1024.0; isink += f(p, 100.0 + (double)(i & 7) * 0.01, 100.02, 100); );
     double t0 = now_ns();
     for (long i = 0; i < n; i++) {
         double p = (double)(i & 1023) / 1024.0;
@@ -167,6 +177,15 @@ typedef struct {
 } pipeline;
 
 static double bench_pipeline(pipeline volatile pl, long n) {
+    for (long i = 0; i < (n >> 3) + 1; i++) {
+        double fx = 1.0 + (double)(i & 255) * 1e-7;
+        pl.scale(A, fx, OUT);
+        double v = pl.vwap_f(OUT, SZ);
+        double p = pl.pressure(BID, ASK);
+        double sig = pl.dot_f(OUT, B);
+        isink += pl.decide_f(p, v, 100.02, (int64_t)(sig > 0.0 ? 100 : 50));
+        gsink += v + p;
+    }
     double t0 = now_ns();
     for (long i = 0; i < n; i++) {
         double fx = 1.0 + (double)(i & 255) * 1e-7;
