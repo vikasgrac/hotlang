@@ -265,6 +265,20 @@ and profiling. hotlang's claim is narrower and stronger: in the subset that
 matters for the innermost loop, the discipline is *the type system*. The
 compiler is the reviewer that never gets tired.
 
+## Status, license, provenance
+
+hotlang is a research project by [Vikas Goenka](https://www.linkedin.com/in/vikasgoenka)
+— an ex-HFT engineer's answer to "what if the zero-allocation discipline
+lived in the compiler instead of code review?" It is not production
+software and ships with no support SLA. Issues and PRs are welcome;
+response times follow a side-project cadence.
+
+Licensed under [Apache-2.0](LICENSE). Built with AI assistance (Anthropic
+Claude) under human direction — including the adversarial review panels
+that falsified this README's original headline claim and forced the honest
+benchmark table above. We consider that provenance a feature: every claim
+here survived an attack, or was reworded until it did.
+
 ## Lineage
 
 Born from building single-digit-microsecond trading systems in Java, where
