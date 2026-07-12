@@ -1,0 +1,12 @@
+// math.hot — builtin coverage for the test harness.
+fn tsqrt(x: f64) -> f64 { return sqrt(x); }
+fn tminf(a: f64, b: f64) -> f64 { return min(a, b); }
+fn tmaxf(a: f64, b: f64) -> f64 { return max(a, b); }
+fn tmini(a: i64, b: i64) -> i64 { return min(a, b); }
+fn tabsi(a: i64) -> i64 { return abs(a); }
+fn tfma(a: f64, b: f64, c: f64) -> f64 { return fma(a, b, c); }
+fn texp(x: f64) -> f64 { return exp(x); }
+fn tlog(x: f64) -> f64 { return log(x); }
+fn tf64(x: i64) -> f64 { return f64(x); }
+fn ti64(x: f64) -> i64 { return i64(x); }
+fn notional(qty: i64, px: f64) -> f64 { return f64(qty) * px; }

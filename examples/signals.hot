@@ -1,0 +1,36 @@
+// signals.hot — market-data hot-path math, the kind that runs per tick.
+// Every function here is verified by hotc: no allocation, no loops,
+// no recursion, no branches (conditionals compile to `select`).
+
+// Exponentially-weighted moving average — classic tick smoothing.
+fn ewma(prev: f64, price: f64, alpha: f64) -> f64 {
+    return alpha * price + (1.0 - alpha) * prev;
+}
+
+// Integer mid-price in ticks.
+fn mid(bid: i64, ask: i64) -> i64 {
+    return (bid + ask) / 2;
+}
+
+// Microprice: size-weighted mid — where the book is leaning.
+fn microprice(bid: f64, ask: f64, bid_sz: f64, ask_sz: f64) -> f64 {
+    return (bid * ask_sz + ask * bid_sz) / (bid_sz + ask_sz);
+}
+
+// Branchless clamp — compiles to two csel/cmov instructions, zero branches.
+fn clamp(x: i64, lo: i64, hi: i64) -> i64 {
+    let floored = if x < lo { lo } else { x };
+    return if floored > hi { hi } else { floored };
+}
+
+// Order-size decision: scale desired size by signal strength, clamp to limits.
+fn order_size(signal: f64, max_size: i64) -> i64 {
+    let scaled = if signal > 1.0 { max_size } else { 0 };
+    return clamp(scaled, 0, max_size);
+}
+
+// Spread in ticks, guarded against crossed books.
+fn spread(bid: i64, ask: i64) -> i64 {
+    let raw = ask - bid;
+    return if raw < 0 { 0 } else { raw };
+}

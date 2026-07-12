@@ -1,0 +1,274 @@
+# hotlang
+
+> A language for hot paths. If it compiles, it cannot allocate, cannot loop
+> forever, cannot recurse, and cannot index out of bounds. No GC. No JIT
+> warmup. No surprises. **It compiles to the code tuned C++ produces — by
+> construction, with proofs. You cannot forget the annotations, because
+> there are none to forget.**
+
+hotlang is a small, from-scratch language for latency-critical inner loops —
+market-data handlers, order books, real-time signal math. It compiles to
+native code via LLVM and exports plain C ABI symbols, so the compiled code
+can be called from C, C++, Rust, or Java (via the Panama FFM API).
+
+The design bet: instead of *checking* a general-purpose language for latency
+sins after the fact, make the sins **inexpressible**, then verify the rest.
+
+## The benchmark — including the comparison that's hard on us
+
+Same machine, same LLVM backend, all calls through volatile function
+pointers. Four columns because one would be misleading: **C++** is
+`clang++ -O3` with default semantics (what you get without effort);
+**C++ tuned** is what a latency-critical desk actually ships — `__restrict`
+on pointer params plus a function-local
+`#pragma clang fp reassociate(on) contract(fast)` (no `-ffast-math` flag
+needed, NaN semantics preserved). Apple M-series, ns/call, lower is better:
+
+| kernel            | hotlang | C++  | C++ tuned | Rust  | vs C++   | vs tuned | vs Rust  |
+|-------------------|---------|------|-----------|-------|----------|----------|----------|
+| dot(256)          | 43.1    | 161.5| 43.7      | 161.7 | **3.7x** | 1.0x     | **3.7x** |
+| book pressure(64) | 11.2    | 28.0 | 11.6      | 27.6  | **2.5x** | 1.0x     | **2.5x** |
+| vwap(64)          | 11.4    | 30.8 | 11.7      | 37.2  | **2.7x** | 1.0x     | **3.3x** |
+| scale ladder(256) | 56.4    | 56.9 | 56.9      | 56.5  | 1.0x     | 1.0x     | 1.0x     |
+| matvec(32×32)     | 118.5   | 230.4| 260.1     | 282.6 | **1.9x** | **2.2x** | **2.4x** |
+| decide (branchy)  | 1.73    | 2.09 | 2.10      | 2.69  | **1.2x** | **1.2x** | **1.6x** |
+| **full tick pipeline** | **106.6** | **329.2** | **107.0** | **325.1** | **3.1x** | 1.0x | **3.1x** |
+
+Read the table honestly and it says three things:
+
+1. **hotlang beats the C++ and Rust people write by default, 2.5–3.7x on
+   reduction-shaped kernels and 3.1x on the full tick pipeline** (normalize
+   ladder → vwap → book pressure → linear signal → branchless decision).
+   The mechanism: hotlang's semantics make FP accumulation reassociable
+   (`reassoc nsz contract` — no `nnan`/`ninf`, NaNs still work) and every
+   array parameter `noalias` by construction, so LLVM vectorizes `dot` into
+   four parallel `fmla.2d` accumulator chains. Strict IEEE order in
+   C++/Rust forces a serial dependency chain.
+2. **A competent C++ dev can reach parity on the reductions** with two
+   annotations per kernel (`__restrict` + the clang fp pragma — TU-local
+   `-ffast-math` does it too). hotlang's claim is not that this is
+   impossible in C++; it's that in hotlang it is *impossible to forget*,
+   on every function, uniformly, with a verifier proving the aliasing and
+   totality facts the annotations merely assert. In C++ the annotations
+   are unchecked promises — get `restrict` wrong and you've bought UB, not
+   speed.
+3. **Where hotlang still wins even against tuned C++** — matvec (2.2x:
+   exact trip counts + guaranteed-disjoint row/vector/output buffers let
+   LLVM pick a better vectorization than it dares with the pragma version)
+   and branchless `decide` (1.2x) — and it never loses: where the language
+   rules grant no extra freedom (pure streaming stores, `scale`), all four
+   columns tie, as they must on the same backend.
+
+One design honesty note: `if` arms are always evaluated (that is what
+branchless means). When one arm carries heavy work — "compute the full
+signal only if the trigger fires" — hotlang pays the full cost every tick,
+where a C++ guard clause skips it. Deterministic worst-case, worse average
+case: that trade is the point of the language, and you should know you're
+making it. A skippable-work construct is on the roadmap.
+
+Reproduce with `bench/bench_hft.c` (build commands in the header; each cell
+is timed exactly once and ratios are computed from the printed cells).
+
+## Guarantees (v0.2)
+
+Every function that compiles is:
+
+- **Allocation-free** — the language has no allocating construct. No heap
+  exists. Zero garbage, so there is nothing to collect. Arrays live in
+  caller-provided buffers; writes go only to `mut` output parameters.
+- **Bounded-execution** — loop bounds are compile-time constants and the
+  compiler rejects any cycle in the call graph (the eBPF-verifier move).
+  Every program provably terminates in a statically known number of steps.
+- **Bounds-proven** — every array access is proven in-bounds at compile
+  time by interval analysis over index expressions. No runtime checks,
+  no UB: the third option is "the program doesn't compile."
+- **Total** — every operation is defined on every input. Integer division
+  cannot fault or hit UB: `a / 0 == 0`, `a % 0 == a`, `MIN / -1 == MIN`
+  (so `a == (a/b)*b + a%b` holds everywhere). The guards are branchless
+  selects — and when interval analysis proves the divisor safe (e.g. a
+  constant, or a range excluding zero), they are omitted entirely and you
+  get raw `sdiv`. Proving safety statically is the fast path.
+- **Branch-honest** — `if` is an expression and compiles to LLVM `select`,
+  which becomes `csel`/`cmov`: no branches, no branch-predictor roulette.
+- **Optimizer-verified** — every function gets LLVM attributes
+  (`nounwind willreturn norecurse`, tight `memory`, `noalias` params)
+  that the verifier has already proven, which LLVM exploits ruthlessly.
+
+## Show me
+
+```text
+// signals.hot
+fn spread(bid: i64, ask: i64) -> i64 {
+    let raw = ask - bid;
+    return if raw < 0 { 0 } else { raw };
+}
+```
+
+```console
+$ hotc build examples/signals.hot -o hotout
+```
+
+```asm
+_spread:                         ; arm64, clang -O3
+    sub  x8, x1, x0
+    bic  x0, x8, x8, asr #63     ; branchless max(0, x)
+    ret
+```
+
+Two instructions. And the recursion that a Java checker would only catch in
+review folklore:
+
+```console
+$ hotc check examples/rejected_recursion.hot
+error: recursion detected: feedback -> echo -> feedback
+  --> examples/rejected_recursion.hot:10:39
+   |
+10 |     return if depth <= 0 { x } else { feedback(depth, x) };
+   |                                       ^
+note: hot paths must have statically bounded execution time; hotlang rejects all recursion at compile time
+```
+
+## Measured (Apple M-series, 100M calls through a volatile function pointer)
+
+| function     | ns/call | notes                                    |
+|--------------|---------|------------------------------------------|
+| `spread`     | ~1.4    | 2 instructions                           |
+| `clamp`      | ~1.4    | branchless `csel`, immune to bad inputs  |
+| `microprice` | ~1.5    | 4-operand size-weighted mid              |
+| `ewma`       | ~4.9    | serial FP dependency chain (honest cost) |
+
+These numbers include the function-call overhead; link-time inlining makes
+them effectively free inside a real host loop.
+
+## Quickstart
+
+```console
+$ cd compiler && cargo build --release       # zero dependencies
+$ cd ..
+$ ./compiler/target/release/hotc check examples/signals.hot
+$ ./compiler/target/release/hotc emit  examples/signals.hot   # read the LLVM IR
+$ ./compiler/target/release/hotc build examples/signals.hot -o hotout
+$ clang -O2 bench/bench.c hotout/signals.o -o hotout/bench && ./hotout/bench
+```
+
+Requires Rust and clang (any clang can compile LLVM IR text — no LLVM dev
+install, no bindings).
+
+## The language (v0.2)
+
+- Types: `i64`, `f64`, `bool`, fixed arrays `[f64; 256]` (parameters only).
+  No implicit conversions; explicit ones are builtins — `f64(qty) * px` is
+  how you write notional, and `i64(x)` truncates toward zero, saturates at
+  the i64 range, and maps NaN to 0 (total, like everything else).
+- `fn name(a: i64, xs: [f64; 64], out: mut [f64; 64]) -> f64 { ... }` —
+  every function returns a value; `mut` arrays are the only write targets.
+- Immutable `let` bindings; `let mut` for loop accumulators; one final
+  `return` (single exit, no `return` inside loops).
+- `for i in 0..256 { ... }` — bounds are integer literals, trip counts are
+  compile-time facts.
+- `arr[i]`, `arr[i + 1]`, `arr[2 * i + j]` — indexes built from loop
+  variables, integer literals, immutable `let`s of those, and `+`/`-`/`*`
+  arithmetic over them (plus `if`-expression unions). Out-of-range is a
+  compile error showing the proven range. Known limit: the prover does not
+  yet refine through `%`, `min`/`max`, or parameter values — so
+  data-dependent indexing (ring-buffer cursors) is currently inexpressible;
+  windowed state is written shift-style into a `mut` buffer instead.
+- `if cond { a } else { b }` is an expression (both arms required, same type).
+  **Both arms are always evaluated** (that's what makes it branchless) —
+  sound because every hotlang expression is total and side-effect-free.
+- `&&` and `||` likewise evaluate both operands (no short-circuit): they are
+  single bitwise instructions, not hidden branches.
+- Functions call other functions in the same module; the whole call graph is
+  visible to the verifier.
+- Numeric literals take `_` separators: `100_000`.
+- Function names may not shadow C runtime symbols (`main`, `malloc`, ...) —
+  exported symbols are the source names.
+
+## Math builtins — port the formulas, don't link the library
+
+`sqrt`, `abs`, `min`, `max`, `fma`, `floor`, `ceil`, `exp`, `log`, `pow`,
+plus the conversions `f64(i64)` and `i64(f64)` — type-overloaded
+(`i64`/`f64` where sensible) and lowered to LLVM intrinsics. `sqrt`/`abs`/`min`/`max`/`fma`/`floor`/`ceil` compile to single
+arm64 instructions (`fsqrt`, `fabs`, `fminnm`, `fmadd`, ...); `exp`/`log`/
+`pow` lower to allocation-free, errno-free libm-grade intrinsics — the only
+calls hotlang ever emits. All total: `abs(MIN) == MIN`, `min`/`max` absorb
+NaN. Builtin names are reserved, so a hotlang module can never shadow libm
+symbols in the host process.
+
+The philosophy for everything above the primitives: **port the math into
+hotlang instead of calling out to a library**. `examples/stats.hot` is a
+quant math library written in hotlang — mean/variance/realized vol,
+z-scores, normal PDF/CDF (Zelen–Severo polynomial, |err| < 7.5e-8), and
+Black-Scholes price/delta verified against textbook values from a C host
+(`tests/math_edge.c`). Ported formulas inline into their call sites,
+vectorize inside loops, and carry the full verifier guarantees; a library
+call boundary can do none of that. Roadmap: `hotport`, a converter that
+transpiles pure scalar C/Java math functions into `.hot` automatically, and
+an `extern pure` FFI contract for the rare case where linking is
+unavoidable.
+
+## Host contract
+
+hotlang guarantees end at the C ABI; the host owes three things per call:
+
+1. **Exact lengths** — a `[f64; 256]` parameter is a pointer to exactly 256
+   doubles. The compiler proved every access in-bounds *against that length*.
+2. **8-byte alignment** — array buffers must be 8-byte aligned (any
+   `malloc`/`new double[n]`/Java `MemorySegment.allocate(n*8, 8)` qualifies).
+3. **No aliasing into `mut` buffers** — a `mut` output array must not
+   overlap any other array argument of the same call. Read-only arrays may
+   alias each other freely. (This is what lets every parameter be `noalias`;
+   violating it is the same UB as violating C `restrict`.)
+
+Java hosts: allocate once at startup with `MemorySegment`, hand the same
+buffers to every call — zero-allocation on both sides of the boundary.
+
+## Architecture
+
+```
+.hot source ──lexer──▶ tokens ──parser──▶ AST ──sema──▶ verified AST
+                                                      │
+                                    (types, returns,  │
+                                     recursion ban)   ▼
+                                              LLVM IR (.ll text)
+                                                      │
+                                            clang -O3 │
+                                                      ▼
+                                     .s  +  .o  +  .dylib/.so (C ABI)
+```
+
+The compiler (`hotc`) is ~2,100 lines of dependency-free Rust: hand-written
+lexer, recursive-descent parser, type checker + bounded-execution verifier
+(interval analysis for bounds and division-safety proofs), and a textual
+LLVM IR emitter. clang does the last mile, so there is no LLVM linkage to
+fight. `tests/run.sh` runs the pass/fail example matrix and division
+edge-case suite.
+
+## Roadmap
+
+- **v0** — scalar functions, branchless conditionals, the verifier. ✅
+- **v0.2 (this)** — bounded loops, fixed arrays, compile-time bounds proofs,
+  `mut` output buffers; beats C++/Rust on reduction-shaped kernels. ✅
+- **v1** — structs, array passing between hotlang functions, worst-case
+  stack depth computed at build time; a guarded/skippable-work construct
+  (deterministic-tail by default, skip-when-provably-idle opt-in); index
+  prover refinement through `%` and `min`/`max` (unlocks ring buffers).
+- **v2** — host embedding story: Java Panama bindings + a shared-memory ring
+  buffer handoff pattern; Rust/C++ header generation.
+- **v3** — statically planned scratch memory: declare bounds, the compiler
+  computes the total memory footprint at build time (the SPARK Ada move).
+
+## Why not just Rust/C++?
+
+You can write this discipline in Rust or C++ — with vigilance, code review,
+and profiling. hotlang's claim is narrower and stronger: in the subset that
+matters for the innermost loop, the discipline is *the type system*. The
+compiler is the reviewer that never gets tired.
+
+## Lineage
+
+Born from building single-digit-microsecond trading systems in Java, where
+zero-allocation style and JIT warmup rituals were enforced by folklore and
+profiling. hotlang inverts that: the guarantees move into the compiler.
+Influences: eBPF's verifier, SPARK Ada's static bounds, Halide/kdb+ as
+domain languages, Rust as implementation substrate.

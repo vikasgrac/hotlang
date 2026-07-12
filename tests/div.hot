@@ -1,0 +1,23 @@
+// div.hot — total integer division semantics under test.
+
+// Unprovable divisor: compiler emits branchless guards.
+fn tdiv(a: i64, b: i64) -> i64 {
+    return a / b;
+}
+
+fn trem(a: i64, b: i64) -> i64 {
+    return a % b;
+}
+
+// Provably safe divisor: compiler emits raw sdiv, zero overhead.
+fn div_const(a: i64) -> i64 {
+    return a / 100;
+}
+
+// Imbalance in basis points — the classic HFT ratio, safe by construction:
+// denominator range is provably positive when sizes are, but here sizes are
+// unknown params so the guard stays — and (b - a) * 10000 / (b + a) with
+// b + a == 0 cleanly yields 0 instead of UB.
+fn imbalance_bps(bid_sz: i64, ask_sz: i64) -> i64 {
+    return (bid_sz - ask_sz) * 10000 / (bid_sz + ask_sz);
+}

@@ -1,0 +1,11 @@
+// rejected_recursion.hot — this file does NOT compile, by design.
+// hotlang's verifier rejects any cycle in the call graph, so every
+// program that compiles provably terminates in bounded time.
+
+fn feedback(depth: i64, x: f64) -> f64 {
+    return echo(depth - 1, x * 0.5);
+}
+
+fn echo(depth: i64, x: f64) -> f64 {
+    return if depth <= 0 { x } else { feedback(depth, x) };
+}

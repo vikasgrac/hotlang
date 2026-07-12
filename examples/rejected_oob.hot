@@ -1,0 +1,11 @@
+// rejected_oob.hot — does NOT compile, by design.
+// The loop runs to 64 but the array has 8 elements. In C++ this is UB you
+// find in production; in hotlang it is a compile error with the proven range.
+
+fn oops(xs: [f64; 8]) -> f64 {
+    let mut acc = 0.0;
+    for i in 0..64 {
+        acc = acc + xs[i];
+    }
+    return acc;
+}

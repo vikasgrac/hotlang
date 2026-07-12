@@ -1,0 +1,73 @@
+// book.hot — order-book kernels: the per-tick math HFT systems actually run.
+// v0.2: bounded loops + fixed arrays. The compiler proves every array
+// access in-bounds and every loop's trip count at compile time.
+
+// Dot product — the core of every linear signal (weights · features).
+fn dot(xs: [f64; 256], ys: [f64; 256]) -> f64 {
+    let mut acc = 0.0;
+    for i in 0..256 {
+        acc = acc + xs[i] * ys[i];
+    }
+    return acc;
+}
+
+// Sum of a level array (total visible size on one side of the book).
+fn side_size(sz: [f64; 64]) -> f64 {
+    let mut acc = 0.0;
+    for i in 0..64 {
+        acc = acc + sz[i];
+    }
+    return acc;
+}
+
+// Book pressure: bid mass / total mass. > 0.5 means bid-heavy.
+fn book_pressure(bid_sz: [f64; 64], ask_sz: [f64; 64]) -> f64 {
+    let mut b = 0.0;
+    let mut a = 0.0;
+    for i in 0..64 {
+        b = b + bid_sz[i];
+        a = a + ask_sz[i];
+    }
+    return b / (a + b);
+}
+
+// Scale a price ladder by a factor (e.g. FX conversion) into an out buffer.
+// `out` is a mut param: hotlang's only write target — caller owns the memory.
+fn scale_ladder(prices: [f64; 256], k: f64, out: mut [f64; 256]) -> f64 {
+    for i in 0..256 {
+        out[i] = prices[i] * k;
+    }
+    return k;
+}
+
+// Size-weighted average price over the top of book.
+fn vwap(px: [f64; 64], sz: [f64; 64]) -> f64 {
+    let mut notional = 0.0;
+    let mut qty = 0.0;
+    for i in 0..64 {
+        notional = notional + px[i] * sz[i];
+        qty = qty + sz[i];
+    }
+    return notional / qty;
+}
+
+// 32x32 matrix-vector product (row-major) — factor models, covariance math.
+// Nested bounded loops; the verifier proves i*32 + j stays inside [0, 1024).
+fn matvec(m: [f64; 1024], v: [f64; 32], out: mut [f64; 32]) -> f64 {
+    for i in 0..32 {
+        let mut acc = 0.0;
+        for j in 0..32 {
+            acc = acc + m[i * 32 + j] * v[j];
+        }
+        out[i] = acc;
+    }
+    return out[31];
+}
+
+// Trading decision from the computed signals — fully branchless.
+fn decide(pressure: f64, vwap_px: f64, mid: f64, max_size: i64) -> i64 {
+    let edge = vwap_px - mid;
+    let buy = pressure > 0.6 && edge > 0.0;
+    let sell = pressure < 0.4 && edge < 0.0;
+    return if buy { max_size } else { if sell { 0 - max_size } else { 0 } };
+}
