@@ -66,17 +66,24 @@ $HOTC build examples/stats.hot -o "$OUT" > /dev/null
 clang -O2 tests/math_edge.c "$OUT/math.o" "$OUT/stats.o" -o "$OUT/math_edge" -lm
 "$OUT/math_edge"
 
-echo "== incremental streaming: correctness + numerical accuracy vs recompute =="
+echo "== incremental streaming: accuracy vs TRUE, decisions exercised, speedup =="
 $HOTC build examples/streaming.hot -o "$OUT" > /dev/null
 if command -v clang++ >/dev/null 2>&1; then
     clang++ -O3 -c bench/ref_streaming.cpp -o "$OUT/ref_streaming.o"
     clang -O2 bench/bench_streaming.c "$OUT/streaming.o" "$OUT/ref_streaming.o" -lm -o "$OUT/bench_streaming"
     SOUT="$("$OUT/bench_streaming")"
-    echo "$SOUT" | grep -E "FUSED|vol|variance"
-    echo "$SOUT" | grep -q "MISMATCH" && { echo "FAIL: incremental decision != recompute"; exit 1; }
-    # variance is the worst-drift case; assert its error line is <= 1e-6
-    verr=$(echo "$SOUT" | awk '/rolling variance/{print $NF}')
-    awk -v e="$verr" 'BEGIN{ if (e+0 > 1e-6){ print "FAIL: variance drift " e " > 1e-6"; exit 1 } else { print "ok   incremental accuracy within 1e-6 (variance err " e ")" } }'
+    echo "$SOUT" | grep -E "rolling vol|FUSED"
+    # 1. vol accuracy vs TRUE long-double reference must be <= 1e-6 (the
+    #    numerically-hard case; the naive Sum(x^2)-mu^2 form fails here).
+    volerr=$(echo "$SOUT" | awk '/rolling vol/{print $NF}')
+    awk -v e="$volerr" 'BEGIN{ if (e+0 > 1e-6){ print "FAIL: vol error vs TRUE " e " > 1e-6"; exit 1 } else { print "ok   vol accurate to " e " vs long-double truth" } }'
+    # 2. decisions must actually be exercised (not trivially all-hold)
+    echo "$SOUT" | awk '/FUSED tick/{ if ($0 ~ /buy=0/ || $0 ~ /sell=0/){ print "FAIL: decisions not exercised"; exit 1 } else print "ok   buy/sell/hold all exercised" }'
+    # 3. incremental and recompute must agree on every decision
+    echo "$SOUT" | awk '/FUSED tick/{ if ($0 !~ /mismatches=0/){ print "FAIL: incremental != recompute decision"; exit 1 } else print "ok   incremental decisions == recompute decisions" }'
+    # 4. the fused-tick incremental win must hold (>= 10x on this W=256 config)
+    sp=$(echo "$SOUT" | awk '/recompute C\+\+/{for(i=1;i<=NF;i++) if($i ~ /^[0-9.]+x$/){gsub(/x/,"",$i); print $i}}')
+    awk -v s="$sp" 'BEGIN{ if (s+0 < 10){ print "FAIL: fused speedup " s "x < 10x"; exit 1 } else print "ok   fused incremental speedup " s "x vs recompute" }'
 else
     echo "skip (clang++ not found)"
 fi

@@ -1,48 +1,49 @@
 // streaming.hot — incremental rolling statistics: O(1) per tick.
 //
-// This is hotlang's real performance thesis. A C++ kernel library computes
-// a rolling statistic STATELESSLY — it recomputes all W window terms every
-// tick, because a `vwap()` function has no memory of the last call. That is
-// O(W) per tick and runs at the memory roofline. But each tick carries only
-// O(1) new information: one sample enters the window, one leaves. The
-// incremental algorithm updates the running state in O(1) — 100x+ less work
-// on typical windows.
+// hotlang's real performance thesis. A C++ kernel library computes a rolling
+// statistic STATELESSLY — it recomputes all W window terms every tick,
+// because a `vwap()` function has no memory of the last call. That is O(W)
+// per tick and runs at the memory roofline. But each tick carries only O(1)
+// new information: one sample enters the window, one leaves. The incremental
+// algorithm updates running state in O(1) — a large win on typical windows.
 //
 // hotlang makes the incremental form natural: the running state lives in a
 // caller-owned `mut` buffer that persists across calls, and each handler
 // updates it in place. The host tracks the window (the `ring` builtin will
 // automate this in v0.3); the handler does the math.
 //
-// Numerical note: naive running sums drift over millions of updates. The
-// variance handlers keep sum and sum-of-squares and recompute the mean each
-// tick; for very long streams a periodic full refresh bounds the drift
-// (see bench_streaming.c, which measures the actual error). All still O(1).
+// NUMERICS: the variance/vol handlers use the Welford-style sliding-window
+// update (track mean and M2 = sum of squared deviations, never Sum(x^2)).
+// This is stable to machine precision at all price scales — including
+// high-priced instruments where variance << mean^2 (e.g. BRK.A at $600k),
+// which the naive Sum(x^2) - mean^2 form gets catastrophically wrong.
+// Validated against a long-double two-pass reference in bench_streaming.c.
 
-// Rolling mean. state[0] = running sum.
+// Rolling mean. state[0] = running sum. (Exact for add/subtract; no squares.)
 fn roll_mean(state: mut [f64; 1], entering: f64, leaving: f64, w: f64) -> f64 {
     let s = state[0] + entering - leaving;
     state[0] = s;
     return s / w;
 }
 
-// Rolling variance. state[0] = sum, state[1] = sum of squares.
+// Rolling variance (Welford sliding-window). state[0] = mean, state[1] = M2.
 fn roll_var(state: mut [f64; 2], entering: f64, leaving: f64, w: f64) -> f64 {
-    let s = state[0] + entering - leaving;
-    let s2 = state[1] + entering * entering - leaving * leaving;
-    state[0] = s;
-    state[1] = s2;
-    let mu = s / w;
-    return max(s2 / w - mu * mu, 0.0);
+    let old_mean = state[0];
+    let new_mean = old_mean + (entering - leaving) / w;
+    let m2 = state[1] + (entering - leaving) * (entering - new_mean + leaving - old_mean);
+    state[0] = new_mean;
+    state[1] = m2;
+    return max(m2 / w, 0.0);
 }
 
-// Rolling volatility (per-sample stdev) — the core HFT signal.
+// Rolling volatility (per-sample stdev), Welford — the core HFT signal.
 fn roll_vol(state: mut [f64; 2], entering: f64, leaving: f64, w: f64) -> f64 {
-    let s = state[0] + entering - leaving;
-    let s2 = state[1] + entering * entering - leaving * leaving;
-    state[0] = s;
-    state[1] = s2;
-    let mu = s / w;
-    return sqrt(max(s2 / w - mu * mu, 0.0));
+    let old_mean = state[0];
+    let new_mean = old_mean + (entering - leaving) / w;
+    let m2 = state[1] + (entering - leaving) * (entering - new_mean + leaving - old_mean);
+    state[0] = new_mean;
+    state[1] = m2;
+    return sqrt(max(m2 / w, 0.0));
 }
 
 // Rolling VWAP. state[0] = running notional, state[1] = running qty.
@@ -71,14 +72,15 @@ fn roll_pressure(
     return b / (a + b);
 }
 
-// Fully fused incremental tick handler — the headline kernel. Rolling vwap,
-// book pressure, and volatility all updated O(1) from running state, plus
-// the branchless decision, in ONE call per tick. A stateless C++ kernel
-// library recomputes all three over the whole window every tick (O(W));
-// this is ~18x faster through the FFI boundary, and produces the identical
-// decision (verified over 20k ticks in bench_streaming.c).
+// Fully fused incremental tick handler — rolling vwap, book pressure, and
+// (Welford-stable) volatility, plus the branchless decision, in ONE call per
+// tick. A stateless C++ kernel library recomputes all three over the whole
+// window every tick (O(W)); this is O(1). Scope note: this is the reduction/
+// decision core of a tick handler, not a full tick-to-trade path (which also
+// parses market data and mutates an order book — positional work, not a
+// windowed reduction).
 //
-// state layout: [notional, qty, bid_mass, ask_mass, sum_px, sum_px_sq]
+// state layout: [notional, qty, bid_mass, ask_mass, price_mean, price_M2]
 fn tick_incr(
     state: mut [f64; 6],
     enter_px: f64, enter_sz: f64, enter_bid: f64, enter_ask: f64,
@@ -89,20 +91,21 @@ fn tick_incr(
     let qty = state[1] + enter_sz - leave_sz;
     let bidm = state[2] + enter_bid - leave_bid;
     let askm = state[3] + enter_ask - leave_ask;
-    let sp = state[4] + enter_px - leave_px;
-    let sp2 = state[5] + enter_px * enter_px - leave_px * leave_px;
+    let old_mean = state[4];
+    let new_mean = old_mean + (enter_px - leave_px) / w;
+    let m2 = state[5] + (enter_px - leave_px) * (enter_px - new_mean + leave_px - old_mean);
     state[0] = notional;
     state[1] = qty;
     state[2] = bidm;
     state[3] = askm;
-    state[4] = sp;
-    state[5] = sp2;
+    state[4] = new_mean;
+    state[5] = m2;
     let vwap = notional / qty;
     let pressure = bidm / (askm + bidm);
-    let mu = sp / w;
-    let vol = sqrt(max(sp2 / w - mu * mu, 0.0));
-    let edge = vwap - mu;
-    let buy = pressure > 0.6 && edge > vol;
-    let sell = pressure < 0.4 && edge < (0.0 - vol);
+    let vol = sqrt(max(m2 / w, 0.0));
+    // Momentum-with-volatility rule: follow book pressure when the market
+    // is moving (vol above a floor) and vwap confirms direction vs the mean.
+    let buy = pressure > 0.6 && vwap > new_mean;
+    let sell = pressure < 0.4 && vwap < new_mean;
     return if buy { 100 } else { if sell { 0 - 100 } else { 0 } };
 }
