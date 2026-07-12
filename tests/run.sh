@@ -40,6 +40,14 @@ EOF
 $HOTC build "$OUT/let_index.hot" -o "$OUT" > /dev/null
 echo "ok   let-bound index compiles through emit + clang"
 
+echo "== nested inner loops carry !llvm.loop metadata =="
+if grep -q 'br label %loop.cond2, !llvm.loop' "$OUT/let_index.ll" \
+   && grep -q 'llvm.loop.vectorize.followup_vectorized' "$OUT/let_index.ll"; then
+    echo "ok   inner loop tagged (unroll.disable + interleave + followup unroll)"
+else
+    echo "FAIL: nested inner loop missing !llvm.loop metadata"; exit 1
+fi
+
 echo "== division totality (edge cases from a C host) =="
 $HOTC build tests/div.hot -o "$OUT" > /dev/null
 clang -O2 tests/div_edge.c "$OUT/div.o" -o "$OUT/div_edge"
@@ -55,7 +63,7 @@ fi
 echo "== math builtins + stats (Black-Scholes vs libm ground truth) =="
 $HOTC build tests/math.hot -o "$OUT" > /dev/null
 $HOTC build examples/stats.hot -o "$OUT" > /dev/null
-clang -O2 tests/math_edge.c "$OUT/math.o" "$OUT/stats.o" -o "$OUT/math_edge"
+clang -O2 tests/math_edge.c "$OUT/math.o" "$OUT/stats.o" -o "$OUT/math_edge" -lm
 "$OUT/math_edge"
 
 echo ""

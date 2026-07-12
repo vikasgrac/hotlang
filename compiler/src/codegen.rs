@@ -12,6 +12,11 @@
 //!   `-ffast-math` hammer.
 //! - **Functions are `nounwind willreturn norecurse`** with tight `memory`
 //!   attributes — claims the verifier in `sema` has already proven.
+//! - **Inner loops of loop nests carry `!llvm.loop` shaping metadata** —
+//!   because trip counts are compile-time facts, the compiler can also tell
+//!   LLVM *how to spend* the freedom the flags grant: keep nested reductions
+//!   rolled for the loop vectorizer, interleave accumulators, then unroll
+//!   the vectorized loop. See `LoopMd` for the measured rationale.
 //!
 //! `let mut` and loop counters lower to entry-block allocas; LLVM's mem2reg
 //! rewrites them into SSA registers, so the emitted IR stays simple.
@@ -67,6 +72,89 @@ struct FnCtx<'a> {
     body: String,
     /// LLVM intrinsic declarations required by builtins used in this module.
     intrinsics: &'a mut BTreeSet<&'static str>,
+    /// Nesting depth of the `for` currently being emitted (0 = not in a loop).
+    loop_depth: u32,
+    /// Module-level `!llvm.loop` metadata for nested inner loops.
+    loop_md: &'a mut LoopMd,
+}
+
+/// Loop metadata emitted on the backedge of every inner loop of a loop nest.
+///
+/// Why: with exact trip counts and `noalias` params, LLVM's early full-unroll
+/// flattens a nested reduction (e.g. matvec's inner dot) into straight-line
+/// code, and on wide targets (AVX-512) SLP then vectorizes it *across* the
+/// outer loop — broadcasting every element of the shared operand into its own
+/// 512-bit register and spilling catastrophically (measured 3x slower than
+/// plain -O3 on Zen 5). The recipe below is target-neutral and was measured
+/// best at both 128-bit and 512-bit widths:
+///   - `unroll.disable`      : keep the inner loop rolled so the loop
+///                             vectorizer, not SLP, owns the reduction;
+///   - `interleave.count 4`  : four parallel vector accumulators break the
+///                             FP-add latency chain (legal: hotlang FP is
+///                             reassociable by definition);
+///   - `followup_vectorized -> isvectorized + unroll.enable` : the followup
+///                             list REPLACES the vectorized loop's metadata,
+///                             so the vector loop sheds `unroll.disable` and
+///                             may be (fully) unrolled — this recovers the
+///                             straight-line code that narrow targets want.
+///                             Properties are listed flat in the followup
+///                             wrapper (not nested in a self-referential
+///                             node) so every LLVM property scan sees them.
+///
+/// Known trade-off: an inner loop the vectorizer REJECTS (e.g. a first-order
+/// recurrence like `e = a*e + x[j]`) never gets its followup applied and
+/// keeps `unroll.disable`. Such loops are latency-chain-bound anyway —
+/// unrolling cannot overlap a serial dependency — so the cost is small, and
+/// recurrences in the *inner* position of a nest are rare in practice.
+///
+/// Only the two self-referential per-loop nodes must be distinct; all
+/// property leaves and the followup wrapper are shared.
+struct LoopMd {
+    next_id: u32,
+    lines: String,
+    /// (unroll.disable, interleave.count, followup wrapper) shared ids.
+    leaves: Option<(u32, u32, u32)>,
+}
+
+impl LoopMd {
+    fn new() -> Self {
+        LoopMd { next_id: 0, lines: String::new(), leaves: None }
+    }
+
+    fn alloc(&mut self) -> u32 {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
+    }
+
+    /// Register metadata for one innermost nested loop; returns the id for
+    /// its backedge `!llvm.loop !N` annotation.
+    fn tag_inner_loop(&mut self) -> u32 {
+        let (dis, ilc, wrap) = match self.leaves {
+            Some(t) => t,
+            None => {
+                let dis = self.alloc();
+                let ilc = self.alloc();
+                let isv = self.alloc();
+                let uen = self.alloc();
+                let wrap = self.alloc();
+                self.lines.push_str(&format!(
+                    "!{dis} = !{{!\"llvm.loop.unroll.disable\"}}\n\
+                     !{ilc} = !{{!\"llvm.loop.interleave.count\", i32 4}}\n\
+                     !{isv} = !{{!\"llvm.loop.isvectorized\", i32 1}}\n\
+                     !{uen} = !{{!\"llvm.loop.unroll.enable\"}}\n\
+                     !{wrap} = !{{!\"llvm.loop.vectorize.followup_vectorized\", !{isv}, !{uen}}}\n"
+                ));
+                self.leaves = Some((dis, ilc, wrap));
+                (dis, ilc, wrap)
+            }
+        };
+        let main = self.alloc();
+        self.lines.push_str(&format!(
+            "!{main} = distinct !{{!{main}, !{dis}, !{ilc}, !{wrap}}}\n"
+        ));
+        main
+    }
 }
 
 impl<'a> FnCtx<'a> {
@@ -108,8 +196,9 @@ pub fn generate(fns: &[FnDef], checked: &Checked, module_name: &str) -> Result<S
     out.push_str("; in-bounds at compile time. Array params are noalias by construction.\n\n");
 
     let mut intrinsics: BTreeSet<&'static str> = BTreeSet::new();
+    let mut loop_md = LoopMd::new();
     for f in fns {
-        out.push_str(&gen_fn(f, checked, &mut intrinsics)?);
+        out.push_str(&gen_fn(f, checked, &mut intrinsics, &mut loop_md)?);
         out.push('\n');
     }
 
@@ -123,6 +212,10 @@ pub fn generate(fns: &[FnDef], checked: &Checked, module_name: &str) -> Result<S
 
     out.push_str("attributes #0 = { nounwind willreturn norecurse memory(none) }\n");
     out.push_str("attributes #1 = { nounwind willreturn norecurse memory(argmem: readwrite) }\n");
+    if !loop_md.lines.is_empty() {
+        out.push('\n');
+        out.push_str(&loop_md.lines);
+    }
     Ok(out)
 }
 
@@ -130,6 +223,7 @@ fn gen_fn(
     f: &FnDef,
     checked: &Checked,
     intrinsics: &mut BTreeSet<&'static str>,
+    loop_md: &mut LoopMd,
 ) -> Result<String, Diag> {
     let mut ctx = FnCtx {
         checked,
@@ -140,6 +234,8 @@ fn gen_fn(
         allocas: String::new(),
         body: String::new(),
         intrinsics,
+        loop_depth: 0,
+        loop_md,
     };
 
     let mut sig_params = Vec::new();
@@ -221,6 +317,13 @@ fn gen_stmts(ctx: &mut FnCtx, stmts: &[Stmt]) -> Result<Vec<String>, Diag> {
                 ctx.emit(format!("store {} {}, ptr {gep}, align 8", ll_elem(elem), val));
             }
             Stmt::For { var, lo, hi, body, .. } => {
+                // Tag only INNERMOST nested loops: inside another loop, and
+                // containing no loop. Middle loops of deeper nests are never
+                // vectorized, so tagging them would just pin unroll.disable.
+                // (Any nested For appears at the top level of `body` — only
+                // For introduces a statement scope — so this scan is deep.)
+                let is_inner = ctx.loop_depth > 0
+                    && !body.iter().any(|s| matches!(s, Stmt::For { .. }));
                 let k = ctx.fresh_label();
                 let slot = ctx.alloca(var, "i64");
                 ctx.emit(format!("store i64 {lo}, ptr {slot}"));
@@ -239,7 +342,9 @@ fn gen_stmts(ctx: &mut FnCtx, stmts: &[Stmt]) -> Result<Vec<String>, Diag> {
                     var.clone(),
                     VarInfo { ty: Ty::I64, mutable: false, range: Some((*lo, *hi - 1)) },
                 );
+                ctx.loop_depth += 1;
                 let inner = gen_stmts(ctx, body)?;
+                ctx.loop_depth -= 1;
                 for name in inner {
                     ctx.env.remove(&name);
                     ctx.loc.remove(&name);
@@ -249,7 +354,14 @@ fn gen_stmts(ctx: &mut FnCtx, stmts: &[Stmt]) -> Result<Vec<String>, Diag> {
                 let next = ctx.fresh();
                 ctx.emit(format!("{next} = add nsw i64 {iv2}, 1"));
                 ctx.emit(format!("store i64 {next}, ptr {slot}"));
-                ctx.emit(format!("br label %loop.cond{k}"));
+                // Inner loops of a nest carry `!llvm.loop` metadata on the
+                // backedge; see `LoopMd` for the measured rationale.
+                if is_inner {
+                    let id = ctx.loop_md.tag_inner_loop();
+                    ctx.emit(format!("br label %loop.cond{k}, !llvm.loop !{id}"));
+                } else {
+                    ctx.emit(format!("br label %loop.cond{k}"));
+                }
 
                 ctx.emit_label(&format!("loop.end{k}"));
                 ctx.env.remove(var);
