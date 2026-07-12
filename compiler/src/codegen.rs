@@ -468,7 +468,11 @@ fn gen_expr(ctx: &mut FnCtx, e: &Expr) -> Result<String, Diag> {
                 (BinOp::Or, _) => "or ".into(),
                 (BinOp::Eq, true) => "fcmp oeq ".into(),
                 (BinOp::Eq, false) => "icmp eq ".into(),
-                (BinOp::Ne, true) => "fcmp one ".into(),
+                // `une` (unordered not-equal), NOT `one`: matches C/Java/IEEE
+                // so `x != x` is the canonical NaN test (true for NaN) and
+                // `==`/`!=` stay complementary. With `one`, LLVM folds
+                // `x != x` to false and deletes NaN guards as dead code.
+                (BinOp::Ne, true) => "fcmp une ".into(),
                 (BinOp::Ne, false) => "icmp ne ".into(),
                 (BinOp::Lt, true) => "fcmp olt ".into(),
                 (BinOp::Lt, false) => "icmp slt ".into(),

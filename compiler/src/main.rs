@@ -73,10 +73,18 @@ fn compile(src: &str, file: &str) -> Result<String, diag::Diag> {
     let toks = lexer::lex(src)?;
     let fns = parser::Parser::new(toks).parse_program()?;
     let checked = sema::check(&fns)?;
-    let module = Path::new(file)
+    // The module name is host-controlled (derived from the source filename)
+    // and is written into the IR text. Sanitize to a safe charset so a
+    // crafted filename cannot inject LLVM IR (e.g. a newline + a global).
+    let raw = Path::new(file)
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "module".to_string());
+    let module: String = raw
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .collect();
+    let module = if module.is_empty() { "module".to_string() } else { module };
     codegen::generate(&fns, &checked, &module)
 }
 

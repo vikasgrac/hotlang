@@ -10,3 +10,5 @@ fn tlog(x: f64) -> f64 { return log(x); }
 fn tf64(x: i64) -> f64 { return f64(x); }
 fn ti64(x: f64) -> i64 { return i64(x); }
 fn notional(qty: i64, px: f64) -> f64 { return f64(qty) * px; }
+fn ne_self(x: f64) -> i64 { return if x != x { 1 } else { 0 }; }
+fn eq_self(x: f64) -> i64 { return if x == x { 1 } else { 0 }; }

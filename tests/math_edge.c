@@ -23,6 +23,8 @@ extern double norm_cdf(double);
 extern double bs_call(double, double, double, double, double);
 extern double bs_delta(double, double, double, double, double);
 extern double zscore(double, double, double);
+extern int64_t ne_self(double);
+extern int64_t eq_self(double);
 
 static int failures = 0;
 #define CHECK_F(expr, want, tol)                                              \
@@ -79,6 +81,13 @@ int main(void) {
 
     CHECK_F(zscore(3.0, 1.0, 2.0), 1.0, 1e-15);
     CHECK_F(zscore(1.0, 1.0, 0.0), 0.0, 1e-3);  // sigma=0 guarded, no inf
+
+    // NaN comparison must match C/IEEE (fcmp une, not one)
+    { double nan = 0.0/0.0;
+      CHECK_I(ne_self(nan), 1);   // NaN != NaN is TRUE (canonical NaN test)
+      CHECK_I(ne_self(3.0), 0);
+      CHECK_I(eq_self(nan), 0);   // NaN == NaN is FALSE
+      CHECK_I(eq_self(3.0), 1); }  // sigma=0 guarded, no inf
 
     printf(failures ? "\n%d FAILURES\n" : "\nALL MATH TESTS PASSED\n", failures);
     return failures != 0;

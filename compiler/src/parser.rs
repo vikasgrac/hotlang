@@ -28,11 +28,17 @@ use crate::lexer::{Tok, Token};
 pub struct Parser {
     toks: Vec<Token>,
     pos: usize,
+    depth: u32,
 }
+
+/// Cap on expression-nesting depth. Recursive descent would otherwise
+/// overflow the stack (SIGABRT, no diagnostic) on a crafted deeply-nested
+/// input — a compile-time DoS. This turns it into an ordinary error.
+const MAX_DEPTH: u32 = 256;
 
 impl Parser {
     pub fn new(toks: Vec<Token>) -> Self {
-        Parser { toks, pos: 0 }
+        Parser { toks, pos: 0, depth: 0 }
     }
 
     fn peek(&self) -> &Token {
@@ -437,6 +443,25 @@ impl Parser {
     }
 
     fn parse_unary(&mut self) -> Result<Expr, Diag> {
+        // Every expression-recursion cycle passes through here (unary
+        // prefixes recurse directly; parens/if re-enter via parse_expr).
+        // Bound the depth so a crafted deeply-nested input yields a
+        // diagnostic instead of a stack-overflow SIGABRT (compile-time DoS).
+        self.depth += 1;
+        if self.depth > MAX_DEPTH {
+            self.depth -= 1;
+            let t = self.peek();
+            return Err(Diag::new("expression nesting is too deep", t.line, t.col).with_note(
+                "hotlang caps nesting depth to keep compilation bounded; \
+                 restructure the expression",
+            ));
+        }
+        let r = self.parse_unary_inner();
+        self.depth -= 1;
+        r
+    }
+
+    fn parse_unary_inner(&mut self) -> Result<Expr, Diag> {
         let t = self.peek().clone();
         match t.tok {
             Tok::Minus => {
