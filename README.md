@@ -154,6 +154,20 @@ $ clang -O2 bench/bench.c hotout/signals.o -o hotout/bench && ./hotout/bench
 Requires Rust and clang (any clang can compile LLVM IR text — no LLVM dev
 install, no bindings).
 
+## Documentation
+
+- **[Language Specification](docs/SPEC.md)** — the normative spec of what
+  compiles today: grammar, types, arithmetic/NaN semantics, guarantees,
+  builtins, and the host ABI contract.
+- **[A Typical HFT Flow](docs/HFT-FLOW.md)** — a market-making tick-to-trade
+  path stage by stage, marking what's real (v0.2) vs. planned (v0.3), with
+  verified code.
+- **[Design RFC: Built-in Data Structures & Configuration](docs/DESIGN-builtins.md)**
+  — the v0.3 proposal: a built-in `ring` buffer for ticks, flat `struct`
+  records for ticks/orders with generated headers, and `const` +
+  build-time `--set` for pre-compiled, configurable strategy parameters.
+  Design open for critique; not yet implemented.
+
 ## The language (v0.2)
 
 - Types: `i64`, `f64`, `bool`, fixed arrays `[f64; 256]` (parameters only).
