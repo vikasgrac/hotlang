@@ -66,5 +66,20 @@ $HOTC build examples/stats.hot -o "$OUT" > /dev/null
 clang -O2 tests/math_edge.c "$OUT/math.o" "$OUT/stats.o" -o "$OUT/math_edge" -lm
 "$OUT/math_edge"
 
+echo "== incremental streaming: correctness + numerical accuracy vs recompute =="
+$HOTC build examples/streaming.hot -o "$OUT" > /dev/null
+if command -v clang++ >/dev/null 2>&1; then
+    clang++ -O3 -c bench/ref_streaming.cpp -o "$OUT/ref_streaming.o"
+    clang -O2 bench/bench_streaming.c "$OUT/streaming.o" "$OUT/ref_streaming.o" -lm -o "$OUT/bench_streaming"
+    SOUT="$("$OUT/bench_streaming")"
+    echo "$SOUT" | grep -E "FUSED|vol|variance"
+    echo "$SOUT" | grep -q "MISMATCH" && { echo "FAIL: incremental decision != recompute"; exit 1; }
+    # variance is the worst-drift case; assert its error line is <= 1e-6
+    verr=$(echo "$SOUT" | awk '/rolling variance/{print $NF}')
+    awk -v e="$verr" 'BEGIN{ if (e+0 > 1e-6){ print "FAIL: variance drift " e " > 1e-6"; exit 1 } else { print "ok   incremental accuracy within 1e-6 (variance err " e ")" } }'
+else
+    echo "skip (clang++ not found)"
+fi
+
 echo ""
 echo "ALL TESTS PASSED"
