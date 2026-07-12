@@ -14,50 +14,98 @@ can be called from C, C++, Rust, or Java (via the Panama FFM API).
 The design bet: instead of *checking* a general-purpose language for latency
 sins after the fact, make the sins **inexpressible**, then verify the rest.
 
-## The benchmark — including the comparison that's hard on us
+## The benchmark — including the comparisons that are hard on us
 
-Same machine, same LLVM backend, all calls through volatile function
-pointers. Four columns because one would be misleading: **C++** is
-`clang++ -O3` with default semantics (what you get without effort);
-**C++ tuned** is what a latency-critical desk actually ships — `__restrict`
-on pointer params plus a function-local
-`#pragma clang fp reassociate(on) contract(fast)` (no `-ffast-math` flag
-needed, NaN semantics preserved). Apple M-series, ns/call, lower is better:
+Six columns because fewer would be misleading: **C++** is `clang++ -O3`
+with default semantics (what you get without effort); **C++ tuned** is what
+a latency-critical desk actually ships — `__restrict` on pointer params
+plus a function-local `#pragma clang fp reassociate(on) contract(fast)`
+(no `-ffast-math` flag needed, NaN semantics preserved); **Rust** is safe
+idiomatic iterator style; **Zig** is `-O ReleaseFast` default semantics;
+**Zig tuned** is `noalias` params + `@setFloatMode(.optimized)` — full
+fast-math including `nnan`/`ninf`, which is strictly *more* optimizer
+freedom than hotlang grants itself. All contenders lower through LLVM
+(clang 18 compiles hotlang's IR and the C++ columns; rustc and zig bundle
+their own — versions disclosed by `bench/bench.sh`), with the CPU-target
+flag tier matched across all six. All calls go through volatile function
+pointers.
 
-| kernel            | hotlang | C++  | C++ tuned | Rust  | vs C++   | vs tuned | vs Rust  |
-|-------------------|---------|------|-----------|-------|----------|----------|----------|
-| dot(256)          | 43.1    | 161.5| 43.7      | 161.7 | **3.7x** | 1.0x     | **3.7x** |
-| book pressure(64) | 11.2    | 28.0 | 11.6      | 27.6  | **2.5x** | 1.0x     | **2.5x** |
-| vwap(64)          | 11.4    | 30.8 | 11.7      | 37.2  | **2.7x** | 1.0x     | **3.3x** |
-| scale ladder(256) | 56.4    | 56.9 | 56.9      | 56.5  | 1.0x     | 1.0x     | 1.0x     |
-| matvec(32×32)     | 118.5   | 230.4| 260.1     | 282.6 | **1.9x** | **2.2x** | **2.4x** |
-| decide (branchy)  | 1.73    | 2.09 | 2.10      | 2.69  | **1.2x** | **1.2x** | **1.6x** |
-| **full tick pipeline** | **106.6** | **329.2** | **107.0** | **325.1** | **3.1x** | 1.0x | **3.1x** |
+**AMD Ryzen 7 9700X (Zen 5, AVX-512), governor `performance`,
+`-march=native` tier, ns/call, median of 3, lower is better:**
 
-Read the table honestly and it says three things:
+| kernel            | hotlang | C++   | C++ tuned | Rust  | Zig   | Zig tuned | vs C++    | vs tuned C++ |
+|-------------------|---------|-------|-----------|-------|-------|-----------|-----------|--------------|
+| dot(256)          | 7.3     | 136.9 | 7.3       | 71.5  | 71.5  | 7.3       | **18.8x** | 1.0x         |
+| book pressure(64) | 2.3     | 14.4  | 2.6       | 11.6  | 14.4  | 2.2       | **6.2x**  | **1.13x**    |
+| vwap(64)          | 2.3     | 20.4  | 2.5       | 20.2  | 17.7  | 2.3       | **9.0x**  | **1.09x**    |
+| scale ladder(256) | 6.3     | 6.0   | 6.1       | 6.1   | 6.3   | 6.2       | 0.96x     | 0.96x        |
+| matvec(32×32)     | 23.7    | 193.4 | 166.7     | 185.8 | 191.2 | 191.1     | **8.2x**  | **7.1x**     |
+| decide (branchy)  | 1.12    | 1.11  | 1.05      | 1.21  | 0.97  | 0.98      | 0.99x     | 0.94x        |
+| **full tick pipeline** | **21.3** | **200.3** | **21.4** | **112.2** | **116.5** | **21.7** | **9.4x** | **1.01x** |
 
-1. **hotlang beats the C++ and Rust people write by default, 2.5–3.7x on
-   reduction-shaped kernels and 3.1x on the full tick pipeline** (normalize
-   ladder → vwap → book pressure → linear signal → branchless decision).
-   The mechanism: hotlang's semantics make FP accumulation reassociable
-   (`reassoc nsz contract` — no `nnan`/`ninf`, NaNs still work) and every
-   array parameter `noalias` by construction, so LLVM vectorizes `dot` into
-   four parallel `fmla.2d` accumulator chains. Strict IEEE order in
-   C++/Rust forces a serial dependency chain.
-2. **A competent C++ dev can reach parity on the reductions** with two
-   annotations per kernel (`__restrict` + the clang fp pragma — TU-local
-   `-ffast-math` does it too). hotlang's claim is not that this is
-   impossible in C++; it's that in hotlang it is *impossible to forget*,
-   on every function, uniformly, with a verifier proving the aliasing and
-   totality facts the annotations merely assert. In C++ the annotations
-   are unchecked promises — get `restrict` wrong and you've bought UB, not
-   speed.
-3. **Where hotlang still wins even against tuned C++** — matvec (2.2x:
-   exact trip counts + guaranteed-disjoint row/vector/output buffers let
-   LLVM pick a better vectorization than it dares with the pragma version)
-   and branchless `decide` (1.2x) — and it never loses: where the language
-   rules grant no extra freedom (pure streaming stores, `scale`), all four
-   columns tie, as they must on the same backend.
+**Apple M4 (macOS, Low Power Mode OFF, full clock, NEON 128-bit),
+median of 3, ns/call** — the same shape at a narrower vector width:
+
+| kernel            | hotlang | C++   | C++ tuned | Rust  | Zig   | Zig tuned | vs C++   | vs tuned C++ |
+|-------------------|---------|-------|-----------|-------|-------|-----------|----------|--------------|
+| dot(256)          | 22.1    | 78.4  | 22.3      | 78.0  | 77.4  | 22.2      | **3.5x** | 1.0x         |
+| book pressure(64) | 5.8     | 14.2  | 5.9       | 13.8  | 14.2  | 5.8       | **2.4x** | 1.02x        |
+| vwap(64)          | 5.8     | 15.9  | 6.0       | 18.6  | 16.5  | 5.9       | **2.7x** | 1.03x        |
+| scale ladder(256) | 18.4    | 18.4  | 18.4      | 18.4  | 18.3  | 18.0      | 1.0x     | 1.0x         |
+| matvec(32×32)     | 45.5    | 112.4 | 127.0     | 140.3 | 142.9 | 49.4      | **2.5x** | **2.8x**     |
+| decide (branchy)  | 0.88    | 1.09  | 1.09      | 1.40  | 1.05  | 1.05      | **1.2x** | **1.2x**     |
+| **full tick pipeline** | **51.7** | **161.5** | **52.0** | **158.4** | **160.0** | **52.5** | **3.1x** | **1.01x** |
+
+Same story, smaller multipliers: the reassociation win scales with vector
+width (2 doubles on NEON vs 8 on AVX-512), so Zen 5 shows 9.4x where M4
+shows 3.1x on the pipeline. The matvec loop-shaping metadata helps *both*
+targets — on M4 it takes matvec from 49.6 ns (metadata stripped) to 45.5,
+flipping a tie with tuned Zig into a 1.10x win, confirming it is not an
+AVX-512-only trick.
+
+(The portable-binary tier — plain `-O3`, SSE2 — and the full six-ratio
+tables live in [bench/RESULTS-x86.md](bench/RESULTS-x86.md), environment
+verbatim.)
+
+Read the table honestly and it says four things:
+
+1. **hotlang beats the C++, Rust, and Zig people write by default —
+   9.4x/5.3x/5.5x on the full tick pipeline** (normalize ladder → vwap →
+   book pressure → linear signal → branchless decision), and up to 18.8x
+   on a single reduction. The mechanism: hotlang's semantics make FP
+   accumulation reassociable (`reassoc nsz contract` — no `nnan`/`ninf`,
+   NaNs still work) and every array parameter `noalias` by construction,
+   so LLVM vectorizes reductions at full AVX-512 width. Strict IEEE order
+   pins C++/Rust/Zig to a serial dependency chain that wider vectors
+   cannot help. Stable Rust has no scoped reassociation opt-in at all —
+   its ceiling on these kernels is the strict-IEEE number.
+2. **A competent C++ dev can reach parity on straight reductions** with
+   two annotations per kernel (`__restrict` + the clang fp pragma), and
+   tuned Zig with full fast-math can too. Where everyone emits the same
+   optimal loop, everyone ties at 1.0x — as they must. hotlang's claim is
+   not that annotations can't exist; it's that in hotlang they are
+   *impossible to forget*, on every function, uniformly, with a verifier
+   proving the aliasing and totality facts the annotations merely assert.
+   In C++ the annotations are unchecked promises — get `restrict` wrong
+   and you've bought UB, not speed.
+3. **Where hotlang beats even the tuned columns** — matvec, 7-8x against
+   *both* tuned C++ and tuned Zig. At AVX-512, LLVM flattens the nested
+   reduction and SLP-vectorizes it into a 32-broadcast register-spill
+   catastrophe — tuned C++ and tuned Zig hit exactly this today (191ns vs
+   their own 139/66ns at the portable tier). hotc emits per-loop
+   `!llvm.loop` policy metadata (keep innermost nested reductions rolled,
+   interleave 4 accumulators, unroll the vectorized loop) — something it
+   can do *because* trip counts and aliasing are compile-time facts of the
+   language, and something no pragma a C++/Zig dev actually ships
+   expresses. It also edges tuned C++ on pressure (1.13x) and vwap (1.09x).
+4. **Where hotlang loses, we publish it**: `scale` (pure streaming stores,
+   all six columns within ~5%, no language freedom to exploit) and
+   `decide` against Zig's branchy code (0.87x) — on a deliberately
+   branch-predictable input pattern that is hotlang's documented worst
+   case (a predictable branch costs ~0; a branchless select always pays
+   both arms; real market data predicts worse). Tuned Zig also edges the
+   pipeline by ~3% at the portable tier, powered by the `nnan`/`ninf`
+   assumptions hotlang refuses (NaN-in ⇒ UB-out is not "total").
 
 One design honesty note: `if` arms are always evaluated (that is what
 branchless means). When one arm carries heavy work — "compute the full
@@ -66,8 +114,11 @@ where a C++ guard clause skips it. Deterministic worst-case, worse average
 case: that trade is the point of the language, and you should know you're
 making it. A skippable-work construct is on the roadmap.
 
-Reproduce with `bench/bench_hft.c` (build commands in the header; each cell
-is timed exactly once and ratios are computed from the printed cells).
+Reproduce with one command: `bench/bench.sh` (builds the compiler, runs the
+correctness suite, builds all six contenders at both flag tiers, prints the
+environment block and three runs of each table; report the median). Within
+a table run, each cell is timed exactly once and ratios are computed from
+the printed cells.
 
 ## Guarantees (v0.2)
 
@@ -93,6 +144,12 @@ Every function that compiles is:
 - **Optimizer-verified** — every function gets LLVM attributes
   (`nounwind willreturn norecurse`, tight `memory`, `noalias` params)
   that the verifier has already proven, which LLVM exploits ruthlessly.
+- **Loop-shaped** — because every trip count is a compile-time fact, the
+  compiler also tells LLVM *how to spend* that freedom: innermost loops of
+  nests carry `!llvm.loop` policy metadata (rolled reduction → interleaved
+  accumulators → unroll the vectorized loop), which is what wins matvec
+  7-8x against tuned C++ and tuned Zig at AVX-512 instead of losing 3x to
+  a register-spill blowup.
 
 ## Show me
 
@@ -129,6 +186,10 @@ note: hot paths must have statically bounded execution time; hotlang rejects all
 ```
 
 ## Measured (Apple M-series, 100M calls through a volatile function pointer)
+
+> Disclosure: the scalar table below was measured in macOS Low Power Mode
+> (~2.08 GHz); absolute latencies are ~2x understated vs full clock. Being
+> re-measured; ratios are unaffected.
 
 | function     | ns/call | notes                                    |
 |--------------|---------|------------------------------------------|
@@ -251,10 +312,10 @@ buffers to every call — zero-allocation on both sides of the boundary.
                                      .s  +  .o  +  .dylib/.so (C ABI)
 ```
 
-The compiler (`hotc`) is ~2,100 lines of dependency-free Rust: hand-written
+The compiler (`hotc`) is ~2,500 lines of dependency-free Rust: hand-written
 lexer, recursive-descent parser, type checker + bounded-execution verifier
 (interval analysis for bounds and division-safety proofs), and a textual
-LLVM IR emitter. clang does the last mile, so there is no LLVM linkage to
+LLVM IR emitter (including the per-loop vectorization-policy metadata). clang does the last mile, so there is no LLVM linkage to
 fight. `tests/run.sh` runs the pass/fail example matrix and division
 edge-case suite.
 
