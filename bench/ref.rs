@@ -1,7 +1,10 @@
 // ref.rs — idiomatic Rust implementations of the same kernels.
-// Compiled rustc -C opt-level=3 (same LLVM backend as hotlang).
-// Safe iterator style inside; C ABI at the boundary. Rust's slices are
-// noalias, but its FP is strict IEEE like C++ — reductions stay scalar.
+// Compiled rustc -C opt-level=3 (rustc bundles its own LLVM; version in the
+// bench.sh environment block). Safe iterator style inside; C ABI at the
+// boundary. Note: because the extern params are raw pointers (C ABI), LLVM
+// gets no noalias from them — reference params would carry it, raw pointers
+// don't. Rust's FP is strict IEEE like C++ (and stable Rust has no scoped
+// reassociation opt-in at all) — reductions stay scalar either way.
 
 use std::slice::from_raw_parts;
 use std::slice::from_raw_parts_mut;

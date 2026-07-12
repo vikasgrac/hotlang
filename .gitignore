@@ -3,3 +3,4 @@ hotout/
 tests/out/
 .DS_Store
 launch/
+.playwright-mcp/

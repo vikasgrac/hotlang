@@ -24,7 +24,7 @@ methodology weakness:
 ## What to run
 
 One turnkey script does everything (build compiler, run correctness suite,
-build all four contenders, run two benchmark tables):
+build all six contenders, run two benchmark tables):
 
 ```bash
 cd <repo>            # the synced hotlang folder
@@ -36,15 +36,17 @@ bench/bench.sh
 `bench/bench.sh` prints an **environment block** (CPU model, governor, turbo
 state, AVX2/AVX-512 presence, compiler versions) followed by **two tables**:
 
-- **baseline** — plain `-O3`. On x86 this is SSE2 (2-wide), the honest
-  "portable binary" number.
-- **native** — `-march=native` (clang) and `-C target-cpu=native` (rustc)
-  applied **equally to all four contenders** (hotlang, C++ default, C++
-  tuned, Rust). This unlocks AVX2/AVX-512 fairly for everyone and is the
-  real test of the vectorization win at full width.
+- **baseline** — plain `-O3` / zig `-mcpu=baseline`. On x86 this is SSE2
+  (2-wide), the honest "portable binary" number.
+- **native** — `-march=native` (clang), `-C target-cpu=native` (rustc), and
+  `-mcpu=native` (zig) applied **equally to all six contenders** (hotlang,
+  C++ default, C++ tuned, Rust, Zig default, Zig tuned). This unlocks
+  AVX2/AVX-512 fairly for everyone and is the real test of the
+  vectorization win at full width.
 
 Prerequisites (install if missing): `cargo`/`rustc` (rustup), `clang`,
-`clang++`. The script checks and complains if any are absent.
+`clang++`, `zig` (ziglang.org tarball; set `ZIG=/path/to/zig` if not on
+PATH). The script checks and complains if any are absent.
 
 ## What to capture and report back
 
@@ -66,11 +68,13 @@ Paste back to Vikas (or write to `bench/RESULTS-x86.md`):
 - The `-march`/`target-cpu` flag must be applied to **hotlang's clang step
   AND every reference compile**, identically. The script does this; don't
   hand-tune one side.
-- Don't touch `bench/ref.cpp` (default C++) or `bench/ref_tuned.cpp`
-  (`__restrict` + `#pragma clang fp reassociate`) — they are the agreed
-  contenders. If you want to try an even-more-tuned C++ (hand-written AVX
-  intrinsics), add it as a *new* column, clearly labeled, never by editing
-  the existing refs.
+- Don't touch `bench/ref.cpp` (default C++), `bench/ref_tuned.cpp`
+  (`__restrict` + `#pragma clang fp reassociate`), `bench/ref.rs`,
+  `bench/ref.zig`, or `bench/ref_tuned.zig` (`noalias` +
+  `@setFloatMode(.optimized)`) — they are the agreed contenders. If you
+  want to try an even-more-tuned variant (hand-written AVX intrinsics),
+  add it as a *new* column, clearly labeled, never by editing the
+  existing refs.
 - Report variance if runs disagree by more than a few %. If the governor
   isn't `performance`, say so — thermal/frequency drift makes numbers
   meaningless otherwise.
