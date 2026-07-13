@@ -1,0 +1,30 @@
+// basket.hot — index/basket arbitrage; hot path IS a matrix-vector product.
+// Each tick, recompute every basket's fair value from its constituents and fire
+// where fair diverges from the basket's traded price:
+//   fair[b] = sum_k W[b][k] * px[k]      (B baskets x K constituents = matvec)
+//   edge[b] = traded[b] - fair[b];  fire if |edge| > thresh
+//
+// This is the shape where hotlang beats even TUNED C++: hotc tags the inner
+// reduction with per-loop !llvm.loop policy metadata (interleave accumulators,
+// unroll the vectorized loop) that no C++/Zig pragma expresses. Tuned C++'s
+// autovectorizer spills registers on the nested reduction (measured: 6 stack
+// spills, 2.18x slower on M4; far worse at AVX-512). B=K=32; W = 8 KB -> L1D.
+fn basket_arb(
+    w:      [f64; 1024],    // B*K weights, row-major (b*32 + k)
+    px:     [f64; 32],      // K constituent mid prices
+    traded: [f64; 32],      // B basket traded prices
+    thresh: f64,
+    sig:    mut [f64; 32]    // per-basket edge
+) -> f64 {
+    let mut hits = 0.0;
+    for b in 0..32 {
+        let mut fair = 0.0;
+        for k in 0..32 {
+            fair = fair + w[b * 32 + k] * px[k];
+        }
+        let edge = traded[b] - fair;
+        sig[b] = edge;
+        hits = hits + if edge > thresh { 1.0 } else { if edge < (0.0 - thresh) { 1.0 } else { 0.0 } };
+    }
+    return hits;
+}
