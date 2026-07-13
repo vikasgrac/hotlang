@@ -3,6 +3,7 @@
 extern uint32_t price_level(uint32_t, uint32_t);
 extern uint64_t ring_slot(uint64_t, uint64_t);
 extern uint32_t cap_size(uint32_t, uint32_t);
+extern uint32_t bucket_hi(uint32_t);
 static int fails=0;
 #define CK(e,w) do{unsigned long long g=(unsigned long long)(e);if(g!=(unsigned long long)(w)){printf("FAIL %-24s got %llu want %llu\n",#e,g,(unsigned long long)(w));fails++;}else printf("ok   %-24s = %llu\n",#e,g);}while(0)
 int main(void){
@@ -14,6 +15,8 @@ int main(void){
   CK(cap_size(500,100), 100);
   CK(cap_size(50,100), 50);
   CK(price_level(4294967295u,1), 4294967295u);  // full u32 range, no sign issues
+  CK(bucket_hi(80), 10);                // /8 -> shift
+  CK(bucket_hi(4294967295u), 536870911u);  // full u32 range shift
   printf(fails?"\n%d UNSIGNED FAILURES\n":"\nALL UNSIGNED TESTS PASSED\n",fails);
   return fails!=0;
 }

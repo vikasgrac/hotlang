@@ -20,7 +20,8 @@ ex-HFT engineer. Questions and feedback welcome (issues, PRs, or LinkedIn).
 
 On an isolated kernel, hotlang and hand-tuned C++ both lower through LLVM to
 the same silicon, so they **tie** — that's physics, and we say so. The wins
-are where the language does *less work* or reaches a substrate C++ can't:
+are where the language does *less work*, reaches a substrate C++ can't, or
+makes the fast, safe choice the one you can't forget:
 
 - **Incremental streaming** — the ring buffer + O(1) rolling-stat updates
   make the streaming algorithm the safe default, beating the stateless
@@ -34,6 +35,20 @@ are where the language does *less work* or reaches a substrate C++ can't:
   the CPU. General C++ can't be synthesized (unbounded loops, allocation,
   recursion); hotlang's guarantees are exactly the synthesis preconditions.
   [compiler/src/verilog.rs](compiler/src/verilog.rs).
+- **The fast type is the natural one** — prices, sizes, sequence numbers and
+  ring indices are never negative, so hotlang's `u16`/`u32`/`u64` carry a
+  proven `[0, 2ⁿ)` range as a *checked type fact*. That lets `x % 8`
+  strength-reduce to a vectorized `and` and a constant `x / 8` to a shift,
+  automatically. This is **not a faster modulo**: write `uint32_t` in C++ and
+  it emits the identical instruction and ties us, as it must. The point is
+  defaults — the *naive* signed spelling `int x % 8` pays a round-toward-zero
+  correction that also halves its vector width, so on 32-bit ints it runs
+  ~4.3x slower here (bitwise-identical output). Either one-word fix erases the
+  gap (`uint32_t`, or `x & 7`); hotlang's only claim is that the fast,
+  non-negative type is the one you reach for by default, and that its
+  compile-checked types rule out the divide-by-zero and signed/unsigned-
+  comparison bugs that push C++ toward signed in the first place.
+  [examples/unsigned.hot](examples/unsigned.hot).
 
 The "faster than C++" headline this README once carried was **falsified by
 adversarial AI review** before it went public (tuned C++ ties on a kernel).
@@ -144,6 +159,64 @@ correctness suite, builds all six contenders at both flag tiers, prints the
 environment block and three runs of each table; report the median). Within
 a table run, each cell is timed exactly once and ratios are computed from
 the printed cells.
+
+### A defaults footnote: what C++'s signed default costs on `% 8`
+
+This is not a cross-language speed win — it belongs here only as a caution
+about default types. `bucketize` is `out[i] = price[i] % 8` over 4096 `u32`
+elements (Apple M4, best-of-9 ns/call, bitwise-identical output across every
+row; harness `bench/bench_unsigned.c`):
+
+| contender                                             | ns/call | vs hotlang  |
+|-------------------------------------------------------|---------|-------------|
+| **hotlang `u32`**                                     | **~140**| —           |
+| C++ `uint32_t` (the type fix)                         | ~145    | ~1.0x (tie) |
+| C++ `int` with `x & 7` (the pow-2 mask idiom)         | ~145    | ~1.0x (tie) |
+| C++ `int` + `__builtin_assume(x>=0)` (UB if negative) | ~145    | ~1.0x (tie) |
+| C++ `int`, naive `x % 8` (signed default)             | ~625    | **~4.3x**   |
+
+Read it honestly: **hotlang's modulo is not faster than C++'s modulo.**
+Given the same type they emit the same instruction and tie — physics. The
+gap is entirely the *default type* on one specific spelling. Signed
+`int % 8` must round toward zero for negative dividends, so clang emits a
+correction sequence (`cmlt/usra/bic/sub`) and — the part worth stating
+precisely — vectorizes it only 2-wide (`.2s`) instead of the 4-wide (`.16b`)
+single `and` the unsigned form gets. It is *not* unvectorized; half the lane
+width plus the per-element correction is the ~4.3x.
+
+The gap needs *two* naive choices, and either one-word fix erases it: switch
+the type to `uint32_t`, **or** keep `int` and write `x & 7` (a power-of-two
+bucket is a mask) — signed `& 7` vectorizes to the same `and` and ties. So
+the ~4.3x is against the naive `signed % 8` spelling specifically, not
+against competent C++.
+
+Two honest scopings:
+
+- **This is the 32-bit-`int` number only.** Signed `int64_t % 8` still pays a
+  correction but a smaller ~1.8x vs `uint64_t` (the 64-bit fix-up is cheaper
+  relative to the work), and it applies only to *integer* power-of-two
+  `%`/`÷` — hash buckets, ring slots, histogram bins, seqnum masks. If the
+  quantity lives in a `double`, this doesn't apply in either direction:
+  `x % 8` becomes `fmod`, a libcall no compiler strength-reduces (~280x
+  slower here), and neither side gets the `and`.
+- **Who actually ships the slow spelling.** General-purpose C++ leans signed
+  by default — Google's C++ Style Guide says not to use unsigned merely to
+  assert non-negativity, and the C++ Core Guidelines agree (ES.102 "use
+  signed types for arithmetic", ES.106 "don't try to avoid negative values by
+  using unsigned"). So the naive idiom is common. But performance-critical
+  code — including trading systems, where ITCH prices are already `uint32`
+  and ring masks are unsigned — often carries these quantities unsigned, in
+  which case it ties us, as it should. A desk that profiled this loop would
+  just write `& 7`.
+
+hotlang's actual contribution here is narrow and worth stating precisely: it
+makes the fast, non-negative type the natural one, and its type checker
+removes two of the footguns that push C++ back to signed — divide/modulo is
+total (`a/0==0`, `a%0==a`, no UB) and a signed/unsigned comparison is a
+compile error, not a silent bug. It does **not** remove the third: unsigned
+subtraction still wraps on underflow, exactly as in C++
+(`u32(5) - u32(10) == 4294967291`). We don't check that, and we don't claim
+to.
 
 ## Guarantees (v0.2)
 
@@ -258,12 +331,18 @@ also runs if `iverilog` is installed.
 
 ## The language
 
-- Types: `i16`, `i32`, `i64`, `f64`, `bool`; fixed arrays `[T; N]` and the
-  `ring[T; N]` circular buffer (parameters only). Narrow `i16`/`i32` are the
-  bit-squeeze lever (integer prices in ticks). No implicit conversions;
-  explicit ones are builtins — `f64(qty) * px` for notional, `i32(x)`/`i16(x)`
-  saturating/truncating, all total. Integer literals infer the narrow type
-  of the other operand when they provably fit (`price / 2`).
+- Types: `i16`/`i32`/`i64` signed, `u16`/`u32`/`u64` unsigned, `f64`,
+  `bool`; fixed arrays `[T; N]` and the `ring[T; N]` circular buffer
+  (parameters only). Narrow `i16`/`i32` are the bit-squeeze lever (integer
+  prices in ticks). The unsigned types carry a proven `[0, 2ⁿ)` range, so
+  `%`/`÷` by a power of two strength-reduce (to `and`/shift) and vectorize;
+  division is total (`a/0==0`, `a%0==a`) and a signed/unsigned comparison is
+  a type error, not a silent conversion — making unsigned the natural type
+  for non-negative prices, sizes, and indices (subtraction still wraps on
+  underflow, as in any language). No implicit conversions; explicit ones are
+  builtins — `f64(qty) * px` for notional, `i32(x)`/`i16(x)`
+  saturating/truncating, all total. Integer literals infer the type of the
+  other operand when they provably fit (`price / 2`).
 - `ring` is the tick-stream primitive: `push r, v` (O(1), masked wrap),
   `r[k]` reads the k-th most recent element in-bounds by construction — the
   language owns the window, so incremental streaming is safe and default.

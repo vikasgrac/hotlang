@@ -1,26 +1,32 @@
-// unsigned.hot — how hotlang beats the tuned C++ a desk actually ships.
+// unsigned.hot — why hotlang makes the fast, non-negative type the natural one.
 //
-// On a single kernel, hotlang and hand-tuned C++ tie (same LLVM, same
-// silicon). But C++ evolved carrying signed `int` as the default, and prices,
-// sizes, sequence numbers, and ring indices are all naturally non-negative.
-// A signed `%`/`/` forces the compiler to emit a sign-correction sequence
-// (it must handle negative dividends), which also blocks wide vectorization.
+// This is NOT a faster modulo. Given the same type, hotlang and C++ emit the
+// same instruction and tie — physics, same as everywhere else. The point is
+// defaults. Prices, sizes, sequence numbers and ring indices are never
+// negative, so hotlang's `u16`/`u32`/`u64` carry a proven [0, 2^n) range in
+// the TYPE. That lets `x % 8` strength-reduce to a single vectorized `and`
+// (4-wide) and a constant `x / 8` to a shift.
 //
-// hotlang's `u16`/`u32`/`u64` carry a [0, 2^n) range in the TYPE — a proof,
-// not an unchecked promise. So `u32 % 8` lowers to a single AND and `u32 / 8`
-// to a shift, vectorized 4-wide, with no sign-correction. Measured ~4.3x
-// faster than the equivalent signed-int C++ at -O3 -march=native, with
-// bitwise-identical output — automatically, and type-safely (no UB, unlike
-// C++'s __builtin_assume, which is undefined if the value is ever negative).
-//
-// All arithmetic is still total: unsigned `a / 0 == 0`, `a % 0 == a`.
+// The naive *signed* spelling `int x % 8` must round toward zero for negative
+// dividends, so it emits a correction sequence and vectorizes only half as
+// wide — ~4.3x slower on 32-bit ints here (bench/bench_unsigned.c). But two
+// one-word fixes erase that in C++: write `uint32_t`, or write `x & 7`. So the
+// win is ergonomic, not physical: the fast type is the one you reach for by
+// default, and its total division (`a/0==0`, `a%0==a`) plus no-implicit-
+// conversion typing remove two footguns that push C++ toward signed. (Unsigned
+// subtraction still wraps on underflow, exactly as in C++ — we don't check that.)
 
-// Bucketize prices into 8 buckets. `% 8` -> single AND, 4-wide (the win).
+// Bucketize prices into 8 buckets. `% 8` -> single vectorized `and` (the point).
 fn bucketize(price: [u32; 4096], out: mut [u32; 4096]) -> u32 {
     for i in 0..4096 {
         out[i] = price[i] % 8;
     }
     return out[0];
+}
+
+// A compile-time power-of-two divide strength-reduces to a shift (`lsr #3`).
+fn bucket_hi(price: u32) -> u32 {
+    return price / 8;
 }
 
 // Price level from a raw price and tick size (unsigned divide -> shift when

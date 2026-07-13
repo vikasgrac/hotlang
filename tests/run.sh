@@ -116,11 +116,18 @@ echo "== unsigned ints (u16/u32/u64): total arithmetic + the strength-reduction 
 $HOTC build examples/unsigned.hot -o "$OUT" > /dev/null
 clang -O2 tests/unsigned_edge.c "$OUT/unsigned.o" -o "$OUT/unsigned_edge"
 "$OUT/unsigned_edge"
-# the win: u32 % 8 must lower to a vector AND (no signed sign-correction)
-if clang -O3 -march=native -S "$OUT/unsigned.ll" -o - 2>/dev/null | sed -n '/bucketize:/,/ret/p' | grep -q "and"; then
-    echo "ok   u32 %% 8 lowers to AND (beats signed C++ ~4x, verified in bench)"
+# the mechanism: u32 % 8 must strength-reduce to a vector AND (no signed
+# round-toward-zero correction), and a constant u32 / 8 to a shift (lsr).
+UASM="$(clang -O3 -march=native -S "$OUT/unsigned.ll" -o - 2>/dev/null)"
+if echo "$UASM" | sed -n '/bucketize:/,/ret/p' | grep -q "and"; then
+    echo "ok   u32 %% 8 -> AND (ties competent C++; ~4.3x vs the signed %% 8 default)"
 else
-    echo "FAIL: u32 %% 8 did not strength-reduce"; exit 1
+    echo "FAIL: u32 %% 8 did not strength-reduce to AND"; exit 1
+fi
+if echo "$UASM" | sed -n '/bucket_hi:/,/ret/p' | grep -qi "lsr\|>> 3\|ushr"; then
+    echo "ok   u32 / 8 -> shift (constant power-of-two divide)"
+else
+    echo "FAIL: u32 / 8 did not strength-reduce to a shift"; exit 1
 fi
 
 echo ""
