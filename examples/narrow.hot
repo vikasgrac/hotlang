@@ -15,7 +15,7 @@
 // Mid-price in ticks. i32 in, i32 out — half the width of the f64 a C++
 // desk would use, twice the packing.
 fn mid(bid: i32, ask: i32) -> i32 {
-    return (bid + ask) / i32(2);
+    return (bid + ask) / 2;
 }
 
 // Spread in ticks, clamped non-negative (branchless min/max).
@@ -26,7 +26,7 @@ fn spread(bid: i32, ask: i32) -> i32 {
 // Order-book imbalance in basis points, integer math end to end. Total
 // division: an empty book (bid_sz + ask_sz == 0) yields 0, never a fault.
 fn imbalance_bps(bid_sz: i32, ask_sz: i32) -> i32 {
-    return (bid_sz - ask_sz) * i32(10000) / (bid_sz + ask_sz);
+    return (bid_sz - ask_sz) * 10000 / (bid_sz + ask_sz);
 }
 
 // Signed distance of a price from a reference, in i16 — a price delta is

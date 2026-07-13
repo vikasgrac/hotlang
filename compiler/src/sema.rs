@@ -437,6 +437,73 @@ pub fn infer_range(e: &Expr, env: &HashMap<String, VarInfo>) -> Option<(i64, i64
     }
 }
 
+fn lit_val(e: &Expr) -> Option<i64> {
+    if let ExprKind::Int(n) = e.kind {
+        Some(n)
+    } else {
+        None
+    }
+}
+
+fn lit_fits(n: i64, ty: Ty) -> bool {
+    match ty {
+        Ty::I16 => (-32768..=32767).contains(&n),
+        Ty::I32 => n >= i32::MIN as i64 && n <= i32::MAX as i64,
+        Ty::I64 => true,
+        _ => false,
+    }
+}
+
+/// Literal type inference for a binary op: a bare integer literal adopts the
+/// (narrower) int type of the other operand, if it provably fits.
+fn resolve_lit_widths(
+    lhs: &Expr,
+    rhs: &Expr,
+    lt: Ty,
+    rt: Ty,
+) -> Result<(Ty, Ty), Diag> {
+    if let Some(n) = lit_val(rhs) {
+        if lt.is_int() && lt != Ty::I64 {
+            return if lit_fits(n, lt) {
+                Ok((lt, lt))
+            } else {
+                Err(Diag::new(
+                    format!("literal `{n}` does not fit `{}`", lt.name()),
+                    rhs.line,
+                    rhs.col,
+                ))
+            };
+        }
+    }
+    if let Some(n) = lit_val(lhs) {
+        if rt.is_int() && rt != Ty::I64 {
+            return if lit_fits(n, rt) {
+                Ok((rt, rt))
+            } else {
+                Err(Diag::new(
+                    format!("literal `{n}` does not fit `{}`", rt.name()),
+                    lhs.line,
+                    lhs.col,
+                ))
+            };
+        }
+    }
+    Ok((lt, rt))
+}
+
+/// The common operand type of a binary op, after literal inference. Codegen
+/// uses this to pick the instruction width.
+pub fn binary_operand_ty(
+    lhs: &Expr,
+    rhs: &Expr,
+    env: &HashMap<String, VarInfo>,
+    sigs: &HashMap<String, FnSig>,
+) -> Result<Ty, Diag> {
+    let lt = type_of(lhs, env, sigs)?;
+    let rt = type_of(rhs, env, sigs)?;
+    Ok(resolve_lit_widths(lhs, rhs, lt, rt)?.0)
+}
+
 /// Infer the type of an expression. Also used by codegen.
 pub fn type_of(
     e: &Expr,
@@ -500,8 +567,11 @@ pub fn type_of(
             }
         }
         ExprKind::Binary { op, lhs, rhs } => {
-            let lt = type_of(lhs, env, sigs)?;
-            let rt = type_of(rhs, env, sigs)?;
+            let lt0 = type_of(lhs, env, sigs)?;
+            let rt0 = type_of(rhs, env, sigs)?;
+            // Literal type inference: a bare integer literal adopts the int
+            // type of the other operand, if it provably fits that width.
+            let (lt, rt) = resolve_lit_widths(lhs, rhs, lt0, rt0)?;
             if lt != rt {
                 return Err(Diag::new(
                     format!(

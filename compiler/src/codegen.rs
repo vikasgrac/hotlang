@@ -23,7 +23,7 @@
 
 use crate::ast::*;
 use crate::diag::Diag;
-use crate::sema::{builtin_ret, infer_range, type_of, Checked, VarInfo};
+use crate::sema::{binary_operand_ty, builtin_ret, infer_range, type_of, Checked, VarInfo};
 use std::collections::{BTreeSet, HashMap};
 
 fn llty(t: Ty) -> &'static str {
@@ -43,6 +43,16 @@ fn ll_elem(e: Elem) -> &'static str {
         Elem::I32 => "i32",
         Elem::I64 => "i64",
         Elem::F64 => "double",
+    }
+}
+
+/// Natural alignment of an element, in bytes — needed so narrow-element
+/// array/ring loads and stores claim the right (not over-stated) alignment.
+fn ealign(e: Elem) -> u32 {
+    match e {
+        Elem::I16 => 2,
+        Elem::I32 => 4,
+        Elem::I64 | Elem::F64 => 8,
     }
 }
 
@@ -333,7 +343,7 @@ fn gen_stmts(ctx: &mut FnCtx, stmts: &[Stmt]) -> Result<Vec<String>, Diag> {
                     ptr,
                     iv
                 ));
-                ctx.emit(format!("store {} {}, ptr {gep}, align 8", ll_elem(elem), val));
+                ctx.emit(format!("store {} {}, ptr {gep}, align {}", ll_elem(elem), val, ealign(elem)));
             }
             Stmt::Push { ring, expr, .. } => {
                 // slot = head & (cap-1); data[slot] = val; head = head + 1
@@ -347,7 +357,7 @@ fn gen_stmts(ctx: &mut FnCtx, stmts: &[Stmt]) -> Result<Vec<String>, Diag> {
                 ctx.emit(format!(
                     "{gep} = getelementptr inbounds {sty}, ptr {ptr}, i64 0, i32 1, i64 {slot}"
                 ));
-                ctx.emit(format!("store {} {}, ptr {gep}, align 8", ll_elem(elem), val));
+                ctx.emit(format!("store {} {}, ptr {gep}, align {}", ll_elem(elem), val, ealign(elem)));
                 let next = ctx.fresh();
                 ctx.emit(format!("{next} = add i64 {head}, 1"));
                 ctx.emit(format!("store i64 {next}, ptr {ptr}, align 8"));
@@ -412,8 +422,6 @@ fn gen_stmts(ctx: &mut FnCtx, stmts: &[Stmt]) -> Result<Vec<String>, Diag> {
     }
     Ok(introduced)
 }
-
-const I64_MIN: &str = "-9223372036854775808";
 
 /// Emit total integer division/remainder. hotlang defines:
 ///   a / 0 == 0        a % 0 == a        (identity a == (a/b)*b + a%b holds)
@@ -622,7 +630,7 @@ fn gen_expr(ctx: &mut FnCtx, e: &Expr) -> Result<String, Diag> {
                     "{gep} = getelementptr inbounds {sty}, ptr {ptr}, i64 0, i32 1, i64 {slot}"
                 ));
                 let dst = ctx.fresh();
-                ctx.emit(format!("{dst} = load {}, ptr {gep}, align 8", ll_elem(elem)));
+                ctx.emit(format!("{dst} = load {}, ptr {gep}, align {}", ll_elem(elem), ealign(elem)));
                 return Ok(dst);
             }
             let (elem, ptr) = array_of(ctx, arr);
@@ -635,7 +643,7 @@ fn gen_expr(ctx: &mut FnCtx, e: &Expr) -> Result<String, Diag> {
                 iv
             ));
             let dst = ctx.fresh();
-            ctx.emit(format!("{dst} = load {}, ptr {gep}, align 8", ll_elem(elem)));
+            ctx.emit(format!("{dst} = load {}, ptr {gep}, align {}", ll_elem(elem), ealign(elem)));
             Ok(dst)
         }
         ExprKind::Unary { op, rhs } => {
@@ -653,7 +661,9 @@ fn gen_expr(ctx: &mut FnCtx, e: &Expr) -> Result<String, Diag> {
             Ok(dst)
         }
         ExprKind::Binary { op, lhs, rhs } => {
-            let lt = type_of(lhs, &ctx.env, &ctx.checked.sigs)?;
+            // Operand width, after literal inference (a literal adopts the
+            // other operand's narrow int type).
+            let lt = binary_operand_ty(lhs, rhs, &ctx.env, &ctx.checked.sigs)?;
             // Integer division/remainder are TOTAL in hotlang: a/0 = 0,
             // a%0 = a, MIN/-1 = MIN, MIN%-1 = 0. Emitted branchlessly; the
             // guards are omitted entirely when interval analysis proves the
