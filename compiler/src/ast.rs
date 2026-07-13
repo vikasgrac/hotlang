@@ -28,6 +28,11 @@ pub enum Ty {
     Bool,
     /// Fixed-size array, parameter-only in v0.2. `[f64; 256]`
     Arr(Elem, u32),
+    /// Circular buffer (the tick-stream primitive). Capacity is a
+    /// power-of-two so indexing masks (`& (N-1)`) instead of dividing, and
+    /// every access is in-bounds by construction. Parameter-only, always
+    /// mutable. `ring[f64; 1024]`
+    Ring(Elem, u32),
 }
 
 impl Ty {
@@ -37,6 +42,7 @@ impl Ty {
             Ty::F64 => "f64".to_string(),
             Ty::Bool => "bool".to_string(),
             Ty::Arr(e, n) => format!("[{}; {}]", e.name(), n),
+            Ty::Ring(e, n) => format!("ring[{}; {}]", e.name(), n),
         }
     }
 
@@ -75,6 +81,9 @@ pub enum Stmt {
     Assign { name: String, expr: Expr, line: u32, col: u32 },
     /// `arr[idx] = expr;` — only valid for `mut` array params.
     Store { arr: String, idx: Expr, expr: Expr, line: u32, col: u32 },
+    /// `push r, expr;` — append to a ring, O(1), overwrites the oldest slot
+    /// when full and advances the head. Only valid for a `mut ring` param.
+    Push { ring: String, expr: Expr, line: u32, col: u32 },
     /// `for i in lo..hi { ... }` — lo/hi are integer literals, so every
     /// loop's trip count is known at compile time.
     For { var: String, lo: i64, hi: i64, body: Vec<Stmt>, line: u32, col: u32 },

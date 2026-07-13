@@ -1,0 +1,43 @@
+// ring.hot — the tick-stream primitive in action.
+//
+// This is what the incremental-streaming thesis becomes once the language
+// owns the window. In examples/streaming.hot the HOST had to track which
+// element enters and which leaves the window — the exact unsafe bookkeeping
+// hotlang is supposed to eliminate. Here the `ring` does it: the host just
+// pushes each new tick, and the ring safely yields the element that leaves
+// (its oldest slot, in-bounds by construction via masked indexing).
+//
+// A ring is a circular buffer of power-of-two capacity. `r[k]` reads the
+// k-th most recent element (k=0 newest); `push r, v` appends in O(1),
+// overwriting the oldest. Capacity N means r[N-1] is the element that will
+// leave the window on the next push — so the handler reads it *before*
+// pushing.
+//
+// PRIMING: a ring starts zero-filled, so signals are only valid once it is
+// full (N pushes). For stable stats (vol), initialize the running state to
+// the true mean/M2 over the primed window before trusting the output — a
+// cold zero-start pollutes M2 with transient large deviations at high price
+// scales. See tests/ring_edge.c for the standard warmup pattern.
+
+// Rolling volatility over the last 256 ticks — one call per tick, O(1),
+// numerically stable (Welford). `win` is the tick history (the language owns
+// the window); `state` holds the running [mean, M2].
+fn roll_vol_stream(win: mut ring[f64; 256], state: mut [f64; 2], price: f64) -> f64 {
+    let leaving = win[255];        // oldest in the window — the ring knows it
+    push win, price;               // O(1) append; overwrites that oldest slot
+    let old_mean = state[0];
+    let new_mean = old_mean + (price - leaving) / 256.0;
+    let m2 = state[1] + (price - leaving) * (price - new_mean + leaving - old_mean);
+    state[0] = new_mean;
+    state[1] = m2;
+    return sqrt(max(m2 / 256.0, 0.0));
+}
+
+// Rolling mean over the last 64 ticks — the host never touches the window.
+fn roll_mean_stream(win: mut ring[f64; 64], state: mut [f64; 1], price: f64) -> f64 {
+    let leaving = win[63];
+    push win, price;
+    let s = state[0] + price - leaving;
+    state[0] = s;
+    return s / 64.0;
+}

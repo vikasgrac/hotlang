@@ -88,5 +88,10 @@ else
     echo "skip (clang++ not found)"
 fi
 
+echo "== ring builtin: host only pushes ticks, ring owns the window =="
+$HOTC build examples/ring.hot -o "$OUT" > /dev/null
+clang -O2 tests/ring_edge.c "$OUT/ring.o" -lm -o "$OUT/ring_edge"
+"$OUT/ring_edge"
+
 echo ""
 echo "ALL TESTS PASSED"

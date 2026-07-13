@@ -31,7 +31,7 @@ fn llty(t: Ty) -> &'static str {
         Ty::I64 => "i64",
         Ty::F64 => "double",
         Ty::Bool => "i1",
-        Ty::Arr(..) => "ptr",
+        Ty::Arr(..) | Ty::Ring(..) => "ptr",
     }
 }
 
@@ -249,6 +249,16 @@ fn gen_fn(
                 sig_params.push(format!("ptr noalias nocapture{ro} align 8 {reg}"));
                 ctx.loc.insert(p.name.clone(), Loc::Arr(reg));
             }
+            Ty::Ring(..) => {
+                // A ring is a pointer to { i64 head; [N x elem] data }.
+                // Even a "read-only" ring is not `readonly` at the ABI: the
+                // head is written by push; but a ring that is never pushed
+                // reads only. We conservatively mark mut rings readwrite.
+                has_arrays = true;
+                let ro = if p.mutable { "" } else { " readonly" };
+                sig_params.push(format!("ptr noalias nocapture{ro} align 8 {reg}"));
+                ctx.loc.insert(p.name.clone(), Loc::Arr(reg));
+            }
             ty => {
                 sig_params.push(format!("{} {}", llty(ty), reg));
                 ctx.loc.insert(p.name.clone(), Loc::Ssa(reg));
@@ -315,6 +325,23 @@ fn gen_stmts(ctx: &mut FnCtx, stmts: &[Stmt]) -> Result<Vec<String>, Diag> {
                     iv
                 ));
                 ctx.emit(format!("store {} {}, ptr {gep}, align 8", ll_elem(elem), val));
+            }
+            Stmt::Push { ring, expr, .. } => {
+                // slot = head & (cap-1); data[slot] = val; head = head + 1
+                let (elem, cap, sty, ptr) = ring_of(ctx, ring);
+                let val = gen_expr(ctx, expr)?;
+                let head = ctx.fresh();
+                ctx.emit(format!("{head} = load i64, ptr {ptr}, align 8"));
+                let slot = ctx.fresh();
+                ctx.emit(format!("{slot} = and i64 {head}, {}", cap - 1));
+                let gep = ctx.fresh();
+                ctx.emit(format!(
+                    "{gep} = getelementptr inbounds {sty}, ptr {ptr}, i64 0, i32 1, i64 {slot}"
+                ));
+                ctx.emit(format!("store {} {}, ptr {gep}, align 8", ll_elem(elem), val));
+                let next = ctx.fresh();
+                ctx.emit(format!("{next} = add i64 {head}, 1"));
+                ctx.emit(format!("store i64 {next}, ptr {ptr}, align 8"));
             }
             Stmt::For { var, lo, hi, body, .. } => {
                 // Tag only INNERMOST nested loops: inside another loop, and
@@ -505,6 +532,21 @@ fn array_of(ctx: &FnCtx, name: &str) -> (Elem, String) {
     (elem, ptr)
 }
 
+/// A ring is a pointer to `{ i64 head; [N x elem] data }`. Returns the
+/// (element type, capacity, LLVM struct type string, base pointer).
+fn ring_of(ctx: &FnCtx, name: &str) -> (Elem, u32, String, String) {
+    let (elem, cap) = match ctx.env[name].ty {
+        Ty::Ring(e, n) => (e, n),
+        _ => unreachable!("sema verified ring type"),
+    };
+    let ptr = match &ctx.loc[name] {
+        Loc::Arr(p) => p.clone(),
+        _ => unreachable!(),
+    };
+    let sty = format!("{{ i64, [{cap} x {}] }}", ll_elem(elem));
+    (elem, cap, sty, ptr)
+}
+
 fn gen_expr(ctx: &mut FnCtx, e: &Expr) -> Result<String, Diag> {
     match &e.kind {
         ExprKind::Int(n) => Ok(n.to_string()),
@@ -522,6 +564,28 @@ fn gen_expr(ctx: &mut FnCtx, e: &Expr) -> Result<String, Diag> {
             Loc::Arr(_) => unreachable!("sema rejects bare array use"),
         },
         ExprKind::Index { arr, idx } => {
+            // Ring index: r[k] is the k-th most recent element.
+            // slot = (head - 1 - k) & (cap-1) — masked, in-bounds by
+            // construction (no branch, no bounds check).
+            if matches!(ctx.env[arr].ty, Ty::Ring(..)) {
+                let (elem, cap, sty, ptr) = ring_of(ctx, arr);
+                let kv = gen_expr(ctx, idx)?;
+                let head = ctx.fresh();
+                ctx.emit(format!("{head} = load i64, ptr {ptr}, align 8"));
+                let hm1 = ctx.fresh();
+                ctx.emit(format!("{hm1} = sub i64 {head}, 1"));
+                let off = ctx.fresh();
+                ctx.emit(format!("{off} = sub i64 {hm1}, {kv}"));
+                let slot = ctx.fresh();
+                ctx.emit(format!("{slot} = and i64 {off}, {}", cap - 1));
+                let gep = ctx.fresh();
+                ctx.emit(format!(
+                    "{gep} = getelementptr inbounds {sty}, ptr {ptr}, i64 0, i32 1, i64 {slot}"
+                ));
+                let dst = ctx.fresh();
+                ctx.emit(format!("{dst} = load {}, ptr {gep}, align 8", ll_elem(elem)));
+                return Ok(dst);
+            }
             let (elem, ptr) = array_of(ctx, arr);
             let iv = gen_expr(ctx, idx)?;
             let gep = ctx.fresh();

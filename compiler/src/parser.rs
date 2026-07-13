@@ -86,6 +86,52 @@ impl Parser {
     }
 
     fn parse_type(&mut self) -> Result<Ty, Diag> {
+        // ring[elem; N] — a circular buffer, capacity must be a power of two.
+        if self.peek().tok == Tok::Ring {
+            let rt = self.advance();
+            self.eat(Tok::LBracket, "`[` (ring types are written `ring[f64; 1024]`)")?;
+            let (ename, eline, ecol) = self.eat_ident("an element type (`i64` or `f64`)")?;
+            let elem = match ename.as_str() {
+                "i64" => Elem::I64,
+                "f64" => Elem::F64,
+                other => {
+                    return Err(Diag::new(
+                        format!("rings of `{other}` are not supported"),
+                        eline,
+                        ecol,
+                    )
+                    .with_note("ring element types are `i64` and `f64`"))
+                }
+            };
+            self.eat(Tok::Semi, "`;` (ring types are written `ring[f64; 1024]`)")?;
+            let t = self.peek().clone();
+            let len = match t.tok {
+                Tok::Int(n) if n > 0 && n <= u32::MAX as i64 => {
+                    self.advance();
+                    n as u32
+                }
+                _ => {
+                    return Err(Diag::new(
+                        format!("expected a positive ring capacity, found {}", t.tok.describe()),
+                        t.line,
+                        t.col,
+                    ))
+                }
+            };
+            self.eat(Tok::RBracket, "`]`")?;
+            if !len.is_power_of_two() {
+                return Err(Diag::new(
+                    format!("ring capacity {len} must be a power of two"),
+                    rt.line,
+                    rt.col,
+                )
+                .with_note(
+                    "power-of-two capacity lets the ring index by masking (`& (N-1)`) \
+                     instead of dividing — the fast, branchless wrap",
+                ));
+            }
+            return Ok(Ty::Ring(elem, len));
+        }
         if self.peek().tok == Tok::LBracket {
             self.advance();
             let (ename, eline, ecol) = self.eat_ident("an element type (`i64` or `f64`)")?;
@@ -170,9 +216,9 @@ impl Parser {
                     false
                 };
                 let ty = self.parse_type()?;
-                if mutable && !matches!(ty, Ty::Arr(..)) {
+                if mutable && !matches!(ty, Ty::Arr(..) | Ty::Ring(..)) {
                     return Err(Diag::new(
-                        format!("parameter `{pname}` cannot be `mut`: only array parameters (output buffers) are mutable"),
+                        format!("parameter `{pname}` cannot be `mut`: only array and ring parameters are mutable"),
                         pline,
                         pcol,
                     ));
@@ -241,6 +287,14 @@ impl Parser {
                 let expr = self.parse_expr()?;
                 self.eat(Tok::Semi, "`;`")?;
                 Ok(Stmt::Return { expr, line: t.line, col: t.col })
+            }
+            Tok::Push => {
+                self.advance();
+                let (ring, _, _) = self.eat_ident("a ring name")?;
+                self.eat(Tok::Comma, "`,` (push is written `push r, value;`)")?;
+                let expr = self.parse_expr()?;
+                self.eat(Tok::Semi, "`;`")?;
+                Ok(Stmt::Push { ring, expr, line: t.line, col: t.col })
             }
             Tok::Ident(name) => {
                 if name == "while" {

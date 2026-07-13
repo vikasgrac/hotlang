@@ -107,9 +107,9 @@ pub fn check(fns: &[FnDef]) -> Result<Checked, Diag> {
                 f.col,
             ));
         }
-        if matches!(f.ret, Ty::Arr(..)) {
+        if matches!(f.ret, Ty::Arr(..) | Ty::Ring(..)) {
             return Err(Diag::new(
-                format!("function `{}` cannot return an array; write into a `mut` array parameter instead", f.name),
+                format!("function `{}` cannot return an array or ring; write into a `mut` parameter instead", f.name),
                 f.line,
                 f.col,
             ));
@@ -189,6 +189,7 @@ fn stmt_pos(s: &Stmt) -> (u32, u32) {
         Stmt::Let { line, col, .. }
         | Stmt::Assign { line, col, .. }
         | Stmt::Store { line, col, .. }
+        | Stmt::Push { line, col, .. }
         | Stmt::For { line, col, .. }
         | Stmt::Return { line, col, .. } => (*line, *col),
     }
@@ -277,6 +278,40 @@ fn check_stmts(
                     return Err(Diag::new(
                         format!(
                             "cannot store `{}` into `{arr}` of element type `{}`",
+                            ty.name(),
+                            elem.name()
+                        ),
+                        *line,
+                        *col,
+                    ));
+                }
+            }
+            Stmt::Push { ring, expr, line, col } => {
+                let info = env.get(ring).cloned().ok_or_else(|| {
+                    Diag::new(format!("unknown variable `{ring}`"), *line, *col)
+                })?;
+                let elem = match info.ty {
+                    Ty::Ring(e, _) => e,
+                    other => {
+                        return Err(Diag::new(
+                            format!("cannot `push` into `{ring}`: it has type `{}`, not a ring", other.name()),
+                            *line,
+                            *col,
+                        ))
+                    }
+                };
+                if !info.mutable {
+                    return Err(Diag::new(
+                        format!("cannot `push` into `{ring}`: declare the parameter `mut ring[..]`"),
+                        *line,
+                        *col,
+                    ));
+                }
+                let ty = type_of(expr, env, sigs)?;
+                if ty != Ty::scalar_of(elem) {
+                    return Err(Diag::new(
+                        format!(
+                            "cannot push `{}` into `{ring}` of element type `{}`",
                             ty.name(),
                             elem.name()
                         ),
@@ -412,9 +447,9 @@ pub fn type_of(
             let info = env.get(name).ok_or_else(|| {
                 Diag::new(format!("unknown variable `{name}`"), e.line, e.col)
             })?;
-            if matches!(info.ty, Ty::Arr(..)) {
+            if matches!(info.ty, Ty::Arr(..) | Ty::Ring(..)) {
                 return Err(Diag::new(
-                    format!("`{name}` is an array; arrays can only be indexed (`{name}[i]`), not used as values"),
+                    format!("`{name}` is an array/ring; it can only be indexed (`{name}[i]`), not used as a value"),
                     e.line,
                     e.col,
                 ));
@@ -427,6 +462,11 @@ pub fn type_of(
             })?;
             let (elem, len) = match info.ty {
                 Ty::Arr(el, n) => (el, n),
+                // ring[k] reads the k-th most recent element; k must be
+                // provably in [0, N). The masked lowering makes it in-bounds
+                // by construction, but we still require a provable range so
+                // the programmer can't read uninitialized/aliased slots.
+                Ty::Ring(el, n) => (el, n),
                 other => {
                     return Err(Diag::new(
                         format!("`{arr}` has type `{}` and cannot be indexed", other.name()),
@@ -541,9 +581,9 @@ pub fn type_of(
                 ));
             }
             for (i, (arg, want)) in args.iter().zip(&sig.params).enumerate() {
-                if matches!(want, Ty::Arr(..)) {
+                if matches!(want, Ty::Arr(..) | Ty::Ring(..)) {
                     return Err(Diag::new(
-                        format!("cannot call `{name}`: passing arrays between hotlang functions is not yet supported"),
+                        format!("cannot call `{name}`: passing arrays/rings between hotlang functions is not yet supported"),
                         e.line,
                         e.col,
                     ));
@@ -663,6 +703,7 @@ fn collect_calls_stmts<'a>(stmts: &'a [Stmt], out: &mut Vec<(&'a str, u32, u32)>
                 collect_calls(idx, out);
                 collect_calls(expr, out);
             }
+            Stmt::Push { expr, .. } => collect_calls(expr, out),
             Stmt::For { body, .. } => collect_calls_stmts(body, out),
         }
     }
