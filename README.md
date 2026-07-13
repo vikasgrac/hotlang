@@ -1,18 +1,40 @@
 # hotlang
 
-> A language for hot paths. If it compiles, it cannot allocate, cannot loop
-> forever, cannot recurse, and cannot index out of bounds. No GC. No JIT
-> warmup. No surprises. **It compiles to the code tuned C++ produces — by
-> construction, with proofs. You cannot forget the annotations, because
-> there are none to forget.**
+> A small, from-scratch language for HFT hot paths. If it compiles, it cannot
+> allocate, cannot loop forever, cannot recurse, and cannot index out of
+> bounds — proven, not reviewed. No GC, no JIT warmup, no surprises.
 
-hotlang is a small, from-scratch language for latency-critical inner loops —
-market-data handlers, order books, real-time signal math. It compiles to
-native code via LLVM and exports plain C ABI symbols, so the compiled code
-can be called from C, C++, Rust, or Java (via the Panama FFM API).
+hotlang is for latency-critical inner loops — market-data handlers, order
+books, real-time signal math. It compiles to native code via LLVM (callable
+from C/C++/Rust/Java via the C ABI) — **and, because its guarantees make a
+program synthesizable, a subset compiles to hardware (Verilog/FPGA).**
 
 The design bet: instead of *checking* a general-purpose language for latency
-sins after the fact, make the sins **inexpressible**, then verify the rest.
+sins after the fact, make the sins **inexpressible**, then verify the rest —
+and let the same guarantees unlock things a general-purpose language can't.
+
+### What makes it fast (honestly)
+
+On an isolated kernel, hotlang and hand-tuned C++ both lower through LLVM to
+the same silicon, so they **tie** — that's physics, and we say so. The wins
+are where the language does *less work* or reaches a substrate C++ can't:
+
+- **Incremental streaming** — the ring buffer + O(1) rolling-stat updates
+  make the streaming algorithm the safe default, beating the stateless
+  recompute a C++ kernel library ships by **~30x** on rolling signals
+  (mean/vol/vwap). [docs/INCREMENTAL.md](docs/INCREMENTAL.md).
+- **Bit-squeeze** — narrow `i32`/`i16` integer prices (a price is an integer
+  in ticks) pack 2–4x more per SIMD lane and cache line than `f64`;
+  measured **~2.4x** on a reduction. [examples/narrow.hot](examples/narrow.hot).
+- **Leave the CPU** — `hotc verilog` turns a loop-free integer function into
+  a combinational circuit, evaluated in one clock cycle, verified to match
+  the CPU. General C++ can't be synthesized (unbounded loops, allocation,
+  recursion); hotlang's guarantees are exactly the synthesis preconditions.
+  [compiler/src/verilog.rs](compiler/src/verilog.rs).
+
+The "faster than C++" headline this README once carried was **falsified by
+adversarial AI review** before it went public (tuned C++ ties on a kernel).
+What survived is the honest story above. See the benchmark section below.
 
 ## The benchmark — including the comparisons that are hard on us
 
@@ -206,14 +228,16 @@ them effectively free inside a real host loop.
 ```console
 $ cd compiler && cargo build --release       # zero dependencies
 $ cd ..
-$ ./compiler/target/release/hotc check examples/signals.hot
-$ ./compiler/target/release/hotc emit  examples/signals.hot   # read the LLVM IR
-$ ./compiler/target/release/hotc build examples/signals.hot -o hotout
+$ ./compiler/target/release/hotc check   examples/signals.hot
+$ ./compiler/target/release/hotc emit    examples/signals.hot   # LLVM IR
+$ ./compiler/target/release/hotc build   examples/signals.hot -o hotout
+$ ./compiler/target/release/hotc verilog examples/narrow.hot    # -> hardware
 $ clang -O2 bench/bench.c hotout/signals.o -o hotout/bench && ./hotout/bench
 ```
 
 Requires Rust and clang (any clang can compile LLVM IR text — no LLVM dev
-install, no bindings).
+install, no bindings). `tests/run.sh` runs the full suite; the hardware test
+also runs if `iverilog` is installed.
 
 ## Documentation
 
@@ -229,12 +253,17 @@ install, no bindings).
   build-time `--set` for pre-compiled, configurable strategy parameters.
   Design open for critique; not yet implemented.
 
-## The language (v0.2)
+## The language
 
-- Types: `i64`, `f64`, `bool`, fixed arrays `[f64; 256]` (parameters only).
-  No implicit conversions; explicit ones are builtins — `f64(qty) * px` is
-  how you write notional, and `i64(x)` truncates toward zero, saturates at
-  the i64 range, and maps NaN to 0 (total, like everything else).
+- Types: `i16`, `i32`, `i64`, `f64`, `bool`; fixed arrays `[T; N]` and the
+  `ring[T; N]` circular buffer (parameters only). Narrow `i16`/`i32` are the
+  bit-squeeze lever (integer prices in ticks). No implicit conversions;
+  explicit ones are builtins — `f64(qty) * px` for notional, `i32(x)`/`i16(x)`
+  saturating/truncating, all total. Integer literals infer the narrow type
+  of the other operand when they provably fit (`price / 2`).
+- `ring` is the tick-stream primitive: `push r, v` (O(1), masked wrap),
+  `r[k]` reads the k-th most recent element in-bounds by construction — the
+  language owns the window, so incremental streaming is safe and default.
 - `fn name(a: i64, xs: [f64; 64], out: mut [f64; 64]) -> f64 { ... }` —
   every function returns a value; `mut` arrays are the only write targets.
 - Immutable `let` bindings; `let mut` for loop accumulators; one final
