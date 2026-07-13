@@ -124,11 +124,13 @@ sound because every hotlang expression is total and side-effect-free.
 
 hotlang arithmetic is **total**: every operation is defined on every input.
 
-### Integer (`i64`)
+### Integer (`i16` / `i32` / `i64`)
 
-- `+ - *` wrap on overflow (two's complement, like Java). This is a
-  deliberate choice, not undefined behavior — the result is always the
-  mathematical result modulo 2⁶⁴.
+- `+ - *` wrap on overflow (two's complement, like Java) at the type's
+  width: modulo 2¹⁶ for `i16`, 2³² for `i32`, 2⁶⁴ for `i64`. This is a
+  deliberate choice, not undefined behavior. (Manual narrowing is therefore
+  the programmer's responsibility to keep in range — widen the intermediate
+  where a product can overflow; see `examples/narrow.hot`.)
 - `/` and `%` are **total**, with no trap and no UB:
   - `a / 0 == 0`
   - `a % 0 == a` (so the identity `a == (a/b)*b + a%b` holds for all `b`)
@@ -187,13 +189,14 @@ where the target allows). Their names are reserved.
 | Builtin        | Signature                          | Notes                          |
 |----------------|-------------------------------------|--------------------------------|
 | `sqrt`         | `(f64) -> f64`                      | `fsqrt`                        |
-| `abs`          | `(f64) -> f64`, `(i64) -> i64`      | `fabs` / `llvm.abs` (total: `abs(MIN)==MIN`) |
-| `min`,`max`    | `(f64,f64)`, `(i64,i64)`            | `fminnm`/`fmaxnm` / `smin`/`smax`; float min/max absorb NaN |
+| `abs`          | `(f64) -> f64`, `(iW) -> iW`        | `fabs` / `llvm.abs` at each width (total: `abs(MIN)==MIN`) |
+| `min`,`max`    | `(f64,f64)`, `(iW,iW)`              | `fminnm`/`fmaxnm` / `smin`/`smax` at each width; float min/max absorb NaN |
 | `fma`          | `(f64,f64,f64) -> f64`              | fused multiply-add             |
 | `floor`,`ceil` | `(f64) -> f64`                      |                                |
 | `exp`,`log`    | `(f64) -> f64`                      | libm-grade intrinsic, alloc-free, errno-free |
 | `pow`          | `(f64,f64) -> f64`                  |                                |
-| `f64`          | `(i64) -> f64`                      | exact integer→double           |
+| `f64`          | `(iW) -> f64`                       | exact integer→double           |
+| `i16`,`i32`    | `(iW) -> i16/i32`, `(f64) -> ...`   | trunc/sext / saturating fptosi (total, `NaN → 0`) |
 | `i64`          | `(f64) -> i64`                      | truncates toward zero, **saturates** at the `i64` range, `NaN → 0` |
 
 Builtin names being reserved also prevents a hotlang module from
@@ -244,6 +247,10 @@ hotlang's guarantees end at the C ABI. Per call, the host must provide:
    overlap any other array argument of the same call. Read-only arrays may
    alias each other. (This is what makes every parameter `noalias`;
    violating it is the same class of UB as violating C `restrict`.)
+
+For a **ring** parameter the host allocates and zero-initializes a struct
+`{ int64_t head; T data[N]; }` (8-byte aligned) and passes a pointer to it;
+the language owns `head`. Same no-aliasing rule as `mut` arrays.
 
 Scalars are passed and returned by value in the natural C types
 (`i64`→`int64_t`, `f64`→`double`, `bool`→`_Bool`/`int`). Array parameters

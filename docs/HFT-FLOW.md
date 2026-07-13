@@ -69,21 +69,21 @@ fn push_and_vol(rets: mut [f64; 64], newest: f64) -> f64 {
 }
 ```
 
-**Planned (🔶), the `ring` builtin makes this O(1) amortized and the index
-in-bounds by construction:**
+**✅ Now, the `ring` builtin makes the window O(1) to maintain and the index
+in-bounds by construction (the host just pushes ticks):**
 
 ```
-// v0.3 design — DOES NOT COMPILE YET
-fn push_and_vol(newest: f64, hist: mut ring[f64; 64]) -> f64 {
-    push hist, newest;               // O(1), overwrites oldest
-    let mut s = 0.0;
-    let mut s2 = 0.0;
-    for k in 0..64 {
-        s = s + hist[k];
-        s2 = s2 + hist[k] * hist[k];
-    }
-    let mu = s / 64.0;
-    return sqrt(max(s2 / 64.0 - mu * mu, 0.0));
+// compiles today (examples/ring.hot) — ring owns the window; the O(1)
+// incremental update reads the leaving element (win[63]) before the push.
+fn roll_vol_stream(win: mut ring[f64; 256], state: mut [f64; 2], price: f64) -> f64 {
+    let leaving = win[255];          // the ring knows what leaves
+    push win, price;                 // O(1) append, masked wrap
+    let old_mean = state[0];
+    let new_mean = old_mean + (price - leaving) / 256.0;
+    let m2 = state[1] + (price - leaving) * (price - new_mean + leaving - old_mean);
+    state[0] = new_mean;
+    state[1] = m2;
+    return sqrt(max(m2 / 256.0, 0.0));   // Welford — stable at any price scale
 }
 ```
 

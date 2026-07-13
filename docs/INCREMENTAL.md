@@ -29,13 +29,21 @@ it's exactly where a streaming language wins.
 
 Measured with `bench/bench_streaming.c` over a 2²⁰-tick stream, W=256:
 
-| rolling statistic | recompute (tuned C++) | incremental | speedup | max rel. error |
-|-------------------|-----------------------|-------------|---------|----------------|
-| variance / vol    | ~26 ns                | ~3.6 ns     | **7x**  | 3.7e-08        |
-| mean              | ~28 ns                | ~0.9 ns     | **31x** | 0 (exact)      |
-| vwap              | ~26 ns                | ~3.4 ns     | **7x**  | 6.0e-14        |
-| book pressure     | ~25 ns                | ~3.2 ns     | **8x**  | 4.7e-15        |
-| **fused tick** (vwap+pressure+vol+decision, one call) | **~64 ns** | **~3.9 ns** | **~17x** | decisions identical |
+Recompute uses the numerically correct two-pass variance (what numpy/pandas
+ship); accuracy is checked against a long-double two-pass reference, not the
+same formula.
+
+| rolling statistic | recompute (tuned C++) | incremental | speedup | err vs TRUE |
+|-------------------|-----------------------|-------------|---------|-------------|
+| mean              | ~25 ns                | ~1.7 ns     | **~15x** | 2.3e-14     |
+| vol (Welford)     | ~192 ns               | ~6.4 ns     | **~30x** | 1.4e-10     |
+| vwap              | ~26 ns                | ~3.4 ns     | **~8x**  | 3.2e-14     |
+| **fused tick** (vwap+pressure+vol+decision, one call) | **~134 ns** | **~4.9 ns** | **~27x** | decisions identical |
+
+(vol's recompute is expensive because the *correct* variance is two-pass;
+the naive one-pass `Σx²−μ²` form is cheaper but numerically broken at high
+price scales — see below. mean's error is ~2e-14, not exactly zero, on
+trending data.)
 
 (These per-call numbers include the FFI boundary cost. The pure inlined
 algorithmic ratio is larger — 137x for mean, 211x for variance — but ~18x is
@@ -107,7 +115,8 @@ The standard objection to incremental algorithms is drift: running sums
 accumulate floating-point error over millions of updates. We measure it. The
 worst relative error over a 2²⁰-tick stream:
 
-- mean: **0** (exact — add then subtract the same magnitudes)
+- mean: ~**2e-14** (near machine precision; exactly 0 only when the data is
+  exactly representable — a property of the values, not the algorithm)
 - vwap, pressure: **1e-14 to 1e-15** (near machine precision)
 - variance, vol: **~3–7e-08** — the `Σx² − μ²` form has mild cancellation;
   this is still 7–8 correct significant figures, far below tick precision.
