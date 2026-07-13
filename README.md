@@ -13,6 +13,9 @@ The design bet: instead of *checking* a general-purpose language for latency
 sins after the fact, make the sins **inexpressible**, then verify the rest —
 and let the same guarantees unlock things a general-purpose language can't.
 
+By [Vikas Goenka](https://www.linkedin.com/in/vikas-goenka-92048512/) — an
+ex-HFT engineer. Questions and feedback welcome (issues, PRs, or LinkedIn).
+
 ### What makes it fast (honestly)
 
 On an isolated kernel, hotlang and hand-tuned C++ both lower through LLVM to
@@ -371,7 +374,7 @@ compiler is the reviewer that never gets tired.
 
 ## Status, license, provenance
 
-hotlang is a research project by [Vikas Goenka](https://www.linkedin.com/in/vikasgoenka)
+hotlang is a research project by [Vikas Goenka](https://www.linkedin.com/in/vikas-goenka-92048512/)
 — an ex-HFT engineer's answer to "what if the zero-allocation discipline
 lived in the compiler instead of code review?" It is not production
 software and ships with no support SLA. Issues and PRs are welcome;
