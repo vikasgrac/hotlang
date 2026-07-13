@@ -28,6 +28,8 @@ use std::collections::{BTreeSet, HashMap};
 
 fn llty(t: Ty) -> &'static str {
     match t {
+        Ty::I16 => "i16",
+        Ty::I32 => "i32",
         Ty::I64 => "i64",
         Ty::F64 => "double",
         Ty::Bool => "i1",
@@ -37,6 +39,8 @@ fn llty(t: Ty) -> &'static str {
 
 fn ll_elem(e: Elem) -> &'static str {
     match e {
+        Elem::I16 => "i16",
+        Elem::I32 => "i32",
         Elem::I64 => "i64",
         Elem::F64 => "double",
     }
@@ -260,7 +264,11 @@ fn gen_fn(
                 ctx.loc.insert(p.name.clone(), Loc::Arr(reg));
             }
             ty => {
-                sig_params.push(format!("{} {}", llty(ty), reg));
+                // Sub-32-bit integers need `signext` for a correct C ABI on
+                // arm64/x86-64 (the value must be sign-extended in-register at
+                // the call boundary). i32/i64/f64 are register-width already.
+                let ext = if ty == Ty::I16 { "signext " } else { "" };
+                sig_params.push(format!("{} {ext}{}", llty(ty), reg));
                 ctx.loc.insert(p.name.clone(), Loc::Ssa(reg));
             }
         }
@@ -271,8 +279,9 @@ fn gen_fn(
     gen_stmts(&mut ctx, &f.body)?;
 
     let attr = if has_arrays { "#1" } else { "#0" };
+    let ret_ext = if f.ret == Ty::I16 { "signext " } else { "" };
     Ok(format!(
-        "define {} @{}({}) local_unnamed_addr {} {{\nentry:\n{}{}}}\n",
+        "define {ret_ext}{} @{}({}) local_unnamed_addr {} {{\nentry:\n{}{}}}\n",
         llty(f.ret),
         f.name,
         sig_params.join(", "),
@@ -414,44 +423,48 @@ const I64_MIN: &str = "-9223372036854775808";
 /// with zero overhead — proving safety statically is the fast path.
 fn gen_int_divrem(
     ctx: &mut FnCtx,
+    ty: Ty,
     op: BinOp,
     lv: String,
     rv: String,
     lhs_range: Option<(i64, i64)>,
     rhs_range: Option<(i64, i64)>,
 ) -> Result<String, Diag> {
+    let t = llty(ty);
+    let bits = ty.int_bits().unwrap();
+    let tmin: i64 = if bits == 64 { i64::MIN } else { -(1i64 << (bits - 1)) };
     let instr = if op == BinOp::Div { "sdiv" } else { "srem" };
     let nonzero = rhs_range.map_or(false, |(lo, hi)| lo > 0 || hi < 0);
     let no_neg1 = rhs_range.map_or(false, |(lo, hi)| lo > -1 || hi < -1);
-    let no_min = lhs_range.map_or(false, |(lo, _)| lo > i64::MIN);
+    let no_min = lhs_range.map_or(false, |(lo, _)| lo > tmin);
     if nonzero && (no_neg1 || no_min) {
         let dst = ctx.fresh();
-        ctx.emit(format!("{dst} = {instr} i64 {lv}, {rv}"));
+        ctx.emit(format!("{dst} = {instr} {t} {lv}, {rv}"));
         return Ok(dst);
     }
     let bz = ctx.fresh();
-    ctx.emit(format!("{bz} = icmp eq i64 {rv}, 0"));
+    ctx.emit(format!("{bz} = icmp eq {t} {rv}, 0"));
     let bm1 = ctx.fresh();
-    ctx.emit(format!("{bm1} = icmp eq i64 {rv}, -1"));
+    ctx.emit(format!("{bm1} = icmp eq {t} {rv}, -1"));
     let amin = ctx.fresh();
-    ctx.emit(format!("{amin} = icmp eq i64 {lv}, {I64_MIN}"));
+    ctx.emit(format!("{amin} = icmp eq {t} {lv}, {tmin}"));
     let ovf = ctx.fresh();
     ctx.emit(format!("{ovf} = and i1 {amin}, {bm1}"));
     let bad = ctx.fresh();
     ctx.emit(format!("{bad} = or i1 {bz}, {ovf}"));
     let bsafe = ctx.fresh();
-    ctx.emit(format!("{bsafe} = select i1 {bad}, i64 1, i64 {rv}"));
+    ctx.emit(format!("{bsafe} = select i1 {bad}, {t} 1, {t} {rv}"));
     let raw = ctx.fresh();
-    ctx.emit(format!("{raw} = {instr} i64 {lv}, {bsafe}"));
+    ctx.emit(format!("{raw} = {instr} {t} {lv}, {bsafe}"));
     let dst = ctx.fresh();
     if op == BinOp::Div {
         let z = ctx.fresh();
-        ctx.emit(format!("{z} = select i1 {bz}, i64 0, i64 {raw}"));
-        ctx.emit(format!("{dst} = select i1 {ovf}, i64 {I64_MIN}, i64 {z}"));
+        ctx.emit(format!("{z} = select i1 {bz}, {t} 0, {t} {raw}"));
+        ctx.emit(format!("{dst} = select i1 {ovf}, {t} {tmin}, {t} {z}"));
     } else {
         let z = ctx.fresh();
-        ctx.emit(format!("{z} = select i1 {bz}, i64 {lv}, i64 {raw}"));
-        ctx.emit(format!("{dst} = select i1 {ovf}, i64 0, i64 {z}"));
+        ctx.emit(format!("{z} = select i1 {bz}, {t} {lv}, {t} {raw}"));
+        ctx.emit(format!("{dst} = select i1 {ovf}, {t} 0, {t} {z}"));
     }
     Ok(dst)
 }
@@ -467,22 +480,42 @@ fn gen_builtin(ctx: &mut FnCtx, name: &str, args: &[Expr]) -> Result<String, Dia
         vals.push(gen_expr(ctx, arg)?);
     }
     let ret = builtin_ret(name, &atys).expect("sema verified builtin overload");
-    // Conversions are single instructions / saturating intrinsics, total:
-    // f64(i64) is exact sitofp; i64(f64) truncates toward zero, saturates
-    // at the i64 range, and maps NaN to 0 (llvm.fptosi.sat semantics).
+    // Conversions — the bit-squeeze operators, all total:
+    //  f64(int)     : exact sitofp
+    //  iW(f64)      : truncate toward zero, saturate to [iW::MIN, iW::MAX],
+    //                 NaN -> 0 (llvm.fptosi.sat)
+    //  iW(int)      : narrow = trunc, widen = sext, same = nop
     if name == "f64" {
+        let src = llty(atys[0]);
         let dst = ctx.fresh();
-        ctx.emit(format!("{dst} = sitofp i64 {} to double", vals[0]));
+        ctx.emit(format!("{dst} = sitofp {src} {} to double", vals[0]));
         return Ok(dst);
     }
-    if name == "i64" {
-        ctx.intrinsics
-            .insert("declare i64 @llvm.fptosi.sat.i64.f64(double)");
+    if name == "i16" || name == "i32" || name == "i64" {
+        let dw = ret.int_bits().unwrap();
+        let dt = llty(ret);
+        if atys[0] == Ty::F64 {
+            let intr: &'static str = match dw {
+                16 => "declare i16 @llvm.fptosi.sat.i16.f64(double)",
+                32 => "declare i32 @llvm.fptosi.sat.i32.f64(double)",
+                _ => "declare i64 @llvm.fptosi.sat.i64.f64(double)",
+            };
+            ctx.intrinsics.insert(intr);
+            let dst = ctx.fresh();
+            ctx.emit(format!("{dst} = call {dt} @llvm.fptosi.sat.{dt}.f64(double {})", vals[0]));
+            return Ok(dst);
+        }
+        // int -> int
+        let sw = atys[0].int_bits().unwrap();
+        let st = llty(atys[0]);
         let dst = ctx.fresh();
-        ctx.emit(format!(
-            "{dst} = call i64 @llvm.fptosi.sat.i64.f64(double {})",
-            vals[0]
-        ));
+        if dw < sw {
+            ctx.emit(format!("{dst} = trunc {st} {} to {dt}", vals[0]));
+        } else if dw > sw {
+            ctx.emit(format!("{dst} = sext {st} {} to {dt}", vals[0]));
+        } else {
+            return Ok(vals[0].clone());
+        }
         return Ok(dst);
     }
     // (intrinsic call target, module-level declaration, trailing extra args)
@@ -493,10 +526,16 @@ fn gen_builtin(ctx: &mut FnCtx, name: &str, args: &[Expr]) -> Result<String, Dia
         ("exp", _) => ("llvm.exp.f64", "declare double @llvm.exp.f64(double)", ""),
         ("log", _) => ("llvm.log.f64", "declare double @llvm.log.f64(double)", ""),
         ("abs", [Ty::F64]) => ("llvm.fabs.f64", "declare double @llvm.fabs.f64(double)", ""),
-        // i1 false: INT64_MIN input is NOT poison — abs(MIN) == MIN, total.
+        // i1 false: MIN input is NOT poison — abs(MIN) == MIN, total.
+        ("abs", [Ty::I16]) => ("llvm.abs.i16", "declare i16 @llvm.abs.i16(i16, i1)", ", i1 false"),
+        ("abs", [Ty::I32]) => ("llvm.abs.i32", "declare i32 @llvm.abs.i32(i32, i1)", ", i1 false"),
         ("abs", [Ty::I64]) => ("llvm.abs.i64", "declare i64 @llvm.abs.i64(i64, i1)", ", i1 false"),
         ("min", [Ty::F64, _]) => ("llvm.minnum.f64", "declare double @llvm.minnum.f64(double, double)", ""),
         ("max", [Ty::F64, _]) => ("llvm.maxnum.f64", "declare double @llvm.maxnum.f64(double, double)", ""),
+        ("min", [Ty::I16, _]) => ("llvm.smin.i16", "declare i16 @llvm.smin.i16(i16, i16)", ""),
+        ("max", [Ty::I16, _]) => ("llvm.smax.i16", "declare i16 @llvm.smax.i16(i16, i16)", ""),
+        ("min", [Ty::I32, _]) => ("llvm.smin.i32", "declare i32 @llvm.smin.i32(i32, i32)", ""),
+        ("max", [Ty::I32, _]) => ("llvm.smax.i32", "declare i32 @llvm.smax.i32(i32, i32)", ""),
         ("min", [Ty::I64, _]) => ("llvm.smin.i64", "declare i64 @llvm.smin.i64(i64, i64)", ""),
         ("max", [Ty::I64, _]) => ("llvm.smax.i64", "declare i64 @llvm.smax.i64(i64, i64)", ""),
         ("pow", _) => ("llvm.pow.f64", "declare double @llvm.pow.f64(double, double)", ""),
@@ -604,7 +643,9 @@ fn gen_expr(ctx: &mut FnCtx, e: &Expr) -> Result<String, Diag> {
             let rv = gen_expr(ctx, rhs)?;
             let dst = ctx.fresh();
             match (op, rt) {
-                (UnOp::Neg, Ty::I64) => ctx.emit(format!("{dst} = sub i64 0, {rv}")),
+                (UnOp::Neg, t) if t.is_int() => {
+                    ctx.emit(format!("{dst} = sub {} 0, {rv}", llty(t)))
+                }
                 (UnOp::Neg, Ty::F64) => ctx.emit(format!("{dst} = fneg {FMF}double {rv}")),
                 (UnOp::Not, _) => ctx.emit(format!("{dst} = xor i1 {rv}, true")),
                 _ => unreachable!("sema rejected"),
@@ -617,12 +658,12 @@ fn gen_expr(ctx: &mut FnCtx, e: &Expr) -> Result<String, Diag> {
             // a%0 = a, MIN/-1 = MIN, MIN%-1 = 0. Emitted branchlessly; the
             // guards are omitted entirely when interval analysis proves the
             // divisor can never be 0 (and the MIN/-1 pair is impossible).
-            if lt == Ty::I64 && matches!(op, BinOp::Div | BinOp::Rem) {
+            if lt.is_int() && matches!(op, BinOp::Div | BinOp::Rem) {
                 let lhs_range = infer_range(lhs, &ctx.env);
                 let rhs_range = infer_range(rhs, &ctx.env);
                 let lv = gen_expr(ctx, lhs)?;
                 let rv = gen_expr(ctx, rhs)?;
-                return gen_int_divrem(ctx, *op, lv, rv, lhs_range, rhs_range);
+                return gen_int_divrem(ctx, lt, *op, lv, rv, lhs_range, rhs_range);
             }
             let lv = gen_expr(ctx, lhs)?;
             let rv = gen_expr(ctx, rhs)?;

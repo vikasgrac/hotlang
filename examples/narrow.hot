@@ -1,0 +1,36 @@
+// narrow.hot — squeezing the bits. The first step toward hotlang's deepest
+// performance lever: represent data in the fewest bits it actually needs,
+// so more of it packs into each SIMD register and each cache line.
+//
+// A market price is an integer number of ticks. Even a $600k instrument in
+// cents is 60 million — 26 bits — so `i32` holds any real price, and `i16`
+// holds any price relative to a nearby reference. Where a C++ system carries
+// prices as 64-bit `double` (for safety), hotlang carries them as `i32`:
+//   - 2x as many lanes per SIMD register (16 i32 vs 8 f64 on AVX-512)
+//   - 2x as much history per cache line
+//   - integer ALUs, no floating-point latency
+// All arithmetic here is total (division cannot fault) and, being integer,
+// exact — no rounding, no reassociation questions.
+
+// Mid-price in ticks. i32 in, i32 out — half the width of the f64 a C++
+// desk would use, twice the packing.
+fn mid(bid: i32, ask: i32) -> i32 {
+    return (bid + ask) / i32(2);
+}
+
+// Spread in ticks, clamped non-negative (branchless min/max).
+fn spread(bid: i32, ask: i32) -> i32 {
+    return max(ask - bid, i32(0));
+}
+
+// Order-book imbalance in basis points, integer math end to end. Total
+// division: an empty book (bid_sz + ask_sz == 0) yields 0, never a fault.
+fn imbalance_bps(bid_sz: i32, ask_sz: i32) -> i32 {
+    return (bid_sz - ask_sz) * i32(10000) / (bid_sz + ask_sz);
+}
+
+// Signed distance of a price from a reference, in i16 — a price delta is
+// small, so 16 bits is plenty and packs 4x vs f64.
+fn delta_ticks(price: i32, reference: i32) -> i16 {
+    return i16(price - reference);
+}

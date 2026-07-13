@@ -93,5 +93,10 @@ $HOTC build examples/ring.hot -o "$OUT" > /dev/null
 clang -O2 tests/ring_edge.c "$OUT/ring.o" -lm -o "$OUT/ring_edge"
 "$OUT/ring_edge"
 
+echo "== narrow integers (i16/i32): bit-squeeze arithmetic + conversions + C ABI =="
+$HOTC build examples/narrow.hot -o "$OUT" > /dev/null
+clang -O2 tests/narrow_edge.c "$OUT/narrow.o" -o "$OUT/narrow_edge"
+"$OUT/narrow_edge"
+
 echo ""
 echo "ALL TESTS PASSED"

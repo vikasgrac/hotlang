@@ -92,6 +92,8 @@ impl Parser {
             self.eat(Tok::LBracket, "`[` (ring types are written `ring[f64; 1024]`)")?;
             let (ename, eline, ecol) = self.eat_ident("an element type (`i64` or `f64`)")?;
             let elem = match ename.as_str() {
+                "i16" => Elem::I16,
+                "i32" => Elem::I32,
                 "i64" => Elem::I64,
                 "f64" => Elem::F64,
                 other => {
@@ -136,6 +138,8 @@ impl Parser {
             self.advance();
             let (ename, eline, ecol) = self.eat_ident("an element type (`i64` or `f64`)")?;
             let elem = match ename.as_str() {
+                "i16" => Elem::I16,
+                "i32" => Elem::I32,
                 "i64" => Elem::I64,
                 "f64" => Elem::F64,
                 other => {
@@ -166,8 +170,10 @@ impl Parser {
             self.eat(Tok::RBracket, "`]`")?;
             return Ok(Ty::Arr(elem, len));
         }
-        let (name, line, col) = self.eat_ident("a type (`i64`, `f64`, `bool`, or `[f64; N]`)")?;
+        let (name, line, col) = self.eat_ident("a type (`i16`, `i32`, `i64`, `f64`, `bool`, or `[f64; N]`)")?;
         match name.as_str() {
+            "i16" => Ok(Ty::I16),
+            "i32" => Ok(Ty::I32),
             "i64" => Ok(Ty::I64),
             "f64" => Ok(Ty::F64),
             "bool" => Ok(Ty::Bool),

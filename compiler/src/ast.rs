@@ -8,6 +8,8 @@
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Elem {
+    I16,
+    I32,
     I64,
     F64,
 }
@@ -15,6 +17,8 @@ pub enum Elem {
 impl Elem {
     pub fn name(&self) -> &'static str {
         match self {
+            Elem::I16 => "i16",
+            Elem::I32 => "i32",
             Elem::I64 => "i64",
             Elem::F64 => "f64",
         }
@@ -23,6 +27,8 @@ impl Elem {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ty {
+    I16,
+    I32,
     I64,
     F64,
     Bool,
@@ -38,6 +44,8 @@ pub enum Ty {
 impl Ty {
     pub fn name(&self) -> String {
         match self {
+            Ty::I16 => "i16".to_string(),
+            Ty::I32 => "i32".to_string(),
             Ty::I64 => "i64".to_string(),
             Ty::F64 => "f64".to_string(),
             Ty::Bool => "bool".to_string(),
@@ -48,9 +56,27 @@ impl Ty {
 
     pub fn scalar_of(e: Elem) -> Ty {
         match e {
+            Elem::I16 => Ty::I16,
+            Elem::I32 => Ty::I32,
             Elem::I64 => Ty::I64,
             Elem::F64 => Ty::F64,
         }
+    }
+
+    /// Signed-integer bit width, or None for non-integer types. The engine
+    /// behind bit-squeezing: interval analysis proves a value fits, and the
+    /// narrowest width wins.
+    pub fn int_bits(&self) -> Option<u32> {
+        match self {
+            Ty::I16 => Some(16),
+            Ty::I32 => Some(32),
+            Ty::I64 => Some(64),
+            _ => None,
+        }
+    }
+
+    pub fn is_int(&self) -> bool {
+        self.int_bits().is_some()
     }
 }
 

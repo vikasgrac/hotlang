@@ -48,7 +48,8 @@ const RESERVED_SYMBOLS: &[&str] = &[
 /// `f64`/`i64` are the explicit conversions (quantities are integers,
 /// prices are doubles — `f64(qty) * px` is line one of real HFT code).
 const BUILTIN_NAMES: &[&str] = &[
-    "sqrt", "abs", "min", "max", "fma", "floor", "ceil", "exp", "log", "pow", "f64", "i64",
+    "sqrt", "abs", "min", "max", "fma", "floor", "ceil", "exp", "log", "pow", "f64", "i64", "i32",
+    "i16",
 ];
 
 pub fn is_builtin(name: &str) -> bool {
@@ -61,13 +62,16 @@ pub fn builtin_ret(name: &str, args: &[Ty]) -> Option<Ty> {
     match (name, args) {
         ("sqrt" | "floor" | "ceil" | "exp" | "log", [Ty::F64]) => Some(Ty::F64),
         ("abs", [Ty::F64]) => Some(Ty::F64),
-        ("abs", [Ty::I64]) => Some(Ty::I64),
+        ("abs", [a]) if a.is_int() => Some(*a),
         ("min" | "max", [Ty::F64, Ty::F64]) => Some(Ty::F64),
-        ("min" | "max", [Ty::I64, Ty::I64]) => Some(Ty::I64),
+        ("min" | "max", [a, b]) if a.is_int() && a == b => Some(*a),
         ("pow", [Ty::F64, Ty::F64]) => Some(Ty::F64),
         ("fma", [Ty::F64, Ty::F64, Ty::F64]) => Some(Ty::F64),
-        ("f64", [Ty::I64]) => Some(Ty::F64),
-        ("i64", [Ty::F64]) => Some(Ty::I64),
+        // conversions — the bit-squeeze operators. Any numeric to any width.
+        ("f64", [a]) if a.is_int() => Some(Ty::F64),
+        ("i16", [a]) if a.is_int() || *a == Ty::F64 => Some(Ty::I16),
+        ("i32", [a]) if a.is_int() || *a == Ty::F64 => Some(Ty::I32),
+        ("i64", [a]) if a.is_int() || *a == Ty::F64 => Some(Ty::I64),
         _ => None,
     }
 }
@@ -481,7 +485,7 @@ pub fn type_of(
         ExprKind::Unary { op, rhs } => {
             let t = type_of(rhs, env, sigs)?;
             match (op, t) {
-                (UnOp::Neg, Ty::I64) | (UnOp::Neg, Ty::F64) => Ok(t),
+                (UnOp::Neg, _) if t.is_int() || t == Ty::F64 => Ok(t),
                 (UnOp::Not, Ty::Bool) => Ok(Ty::Bool),
                 (UnOp::Neg, other) => Err(Diag::new(
                     format!("cannot negate a `{}`", other.name()),
