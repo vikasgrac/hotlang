@@ -1,10 +1,9 @@
-# Design RFC: Built-in Data Structures & Configuration
+# Built-in Data Structures & Configuration
 
-> **Status: DESIGN — not yet implemented.** This document proposes the
-> v0.3 feature set. None of the syntax below compiles today. It is
-> published so the design can be critiqued before it is built, and so the
-> intended shape of a real hotlang trading kernel is visible. Everything in
-> [SPEC.md](SPEC.md) is what actually works now.
+> **Status: `ring` is IMPLEMENTED (see `examples/ring.hot`); `struct` and
+> `const` are still DESIGN.** The ring section below reflects the shipped
+> feature; the struct/const sections propose the remaining v0.3 set and do
+> not compile yet. Everything in [SPEC.md](SPEC.md) is the stable surface.
 
 The v0.2 language proves guarantees over scalar and fixed-array math. To
 express a real HFT hot path — ingest ticks, maintain a book, run a
@@ -18,19 +17,20 @@ hand-rolled C ring buffer or a `std::` container cannot offer.
 
 ---
 
-## 1. `ring` — a built-in circular buffer for incoming ticks
+## 1. `ring` — a built-in circular buffer for incoming ticks  ✅ IMPLEMENTED
 
 The most common HFT structure: a fixed-capacity circular buffer of the last
-*N* items (ticks, prices, sizes). The v0.2 bounds prover cannot see through
-a `% N` cursor, so users cannot build one safely. Making it a primitive
-fixes that: the compiler owns the index arithmetic and proves it in-bounds.
+*N* items (ticks, prices, sizes). The v0.2 bounds prover could not see
+through a `% N` cursor, so users could not build one safely. As a primitive,
+the compiler owns the index arithmetic and proves it in-bounds by
+construction. Working example: `examples/ring.hot`.
 
-### Proposed syntax
+### Syntax (compiles today)
 
 ```
 // A ring is declared with a power-of-two capacity and an element type.
-// Capacity is a compile-time constant; storage is a fixed, zero-initialized,
-// cache-line-aligned buffer owned by the host (like array params today).
+// Storage is a host-owned, zero-initialized buffer laid out as
+// { i64 head; elem data[N] } (like array params, plus the head cursor).
 fn on_tick(px: f64, hist: mut ring[f64; 1024]) -> f64 {
     push hist, px;              // O(1); overwrites the oldest when full
     return hist[0];             // hist[0] = newest, hist[1] = previous, ...
@@ -56,10 +56,20 @@ fn on_tick(px: f64, hist: mut ring[f64; 1024]) -> f64 {
 
 ### What it unlocks
 
-Rolling window analytics in O(1) per tick instead of the O(N)
-shift-the-whole-window workaround v0.2 forces:
+For **sum-decomposable** statistics (mean, variance/vol via Welford, vwap,
+book pressure), the ring gives the leaving element so the running aggregate
+updates in **O(1) per tick** — the whole incremental-streaming thesis, now
+ergonomic and safe (`examples/ring.hot`, `examples/streaming.hot`).
+
+Honest scope note: the ring gives O(1) *only* for stats where knowing the
+entering and leaving element suffices. **Rolling max/min and median are NOT
+sum-decomposable** — when the leaving element was the max, you must rescan.
+A ring-based `rolling_max` is still an O(W) scan per tick:
 
 ```
+// O(W) per tick — the ring does NOT make max incremental. For true O(1)
+// rolling max you need a monotonic deque (a planned separate primitive);
+// this simple form just avoids the manual shift/cursor bookkeeping.
 fn rolling_max(px: f64, win: mut ring[f64; 64]) -> f64 {
     push win, px;
     let mut m = win[0];
