@@ -23,10 +23,17 @@ fn spread(bid: i32, ask: i32) -> i32 {
     return max(ask - bid, i32(0));
 }
 
-// Order-book imbalance in basis points, integer math end to end. Total
-// division: an empty book (bid_sz + ask_sz == 0) yields 0, never a fault.
+// Order-book imbalance in basis points. Prices/sizes are stored narrow
+// (i32), but the intermediate `(bid_sz - ask_sz) * 10000` overflows i32 once
+// sizes pass ~214k shares — ordinary in liquid equities. So the arithmetic
+// widens to i64 for the multiply, then narrows the result (bps is ±10000,
+// fits i32). This is the discipline manual narrowing demands, and exactly
+// why the interval prover proving the safe width automatically is the goal:
+// get it wrong and you silently sign-flip a signal.
 fn imbalance_bps(bid_sz: i32, ask_sz: i32) -> i32 {
-    return (bid_sz - ask_sz) * 10000 / (bid_sz + ask_sz);
+    let num = i64(bid_sz - ask_sz) * 10000;
+    let den = i64(bid_sz + ask_sz);
+    return i32(num / den);
 }
 
 // Signed distance of a price from a reference, in i16 — a price delta is

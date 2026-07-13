@@ -438,10 +438,18 @@ pub fn infer_range(e: &Expr, env: &HashMap<String, VarInfo>) -> Option<(i64, i64
 }
 
 fn lit_val(e: &Expr) -> Option<i64> {
-    if let ExprKind::Int(n) = e.kind {
-        Some(n)
-    } else {
-        None
+    match &e.kind {
+        ExprKind::Int(n) => Some(*n),
+        // A negative literal parses as Unary(Neg, Int) — treat it as one
+        // literal so `x + -5` / `x > -5` infer the narrow width too.
+        ExprKind::Unary { op: UnOp::Neg, rhs } => {
+            if let ExprKind::Int(n) = rhs.kind {
+                n.checked_neg()
+            } else {
+                None
+            }
+        }
+        _ => None,
     }
 }
 

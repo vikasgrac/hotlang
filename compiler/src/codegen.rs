@@ -647,6 +647,11 @@ fn gen_expr(ctx: &mut FnCtx, e: &Expr) -> Result<String, Diag> {
             Ok(dst)
         }
         ExprKind::Unary { op, rhs } => {
+            // Fold a negated integer literal to a constant so it is
+            // width-agnostic (usable at i16/i32/i64 without an i64 `sub`).
+            if let (UnOp::Neg, ExprKind::Int(n)) = (op, &rhs.kind) {
+                return Ok(format!("{}", -n));
+            }
             let rt = type_of(rhs, &ctx.env, &ctx.checked.sigs)?;
             let rv = gen_expr(ctx, rhs)?;
             let dst = ctx.fresh();
@@ -722,11 +727,15 @@ fn gen_expr(ctx: &mut FnCtx, e: &Expr) -> Result<String, Diag> {
             for arg in args {
                 let at = type_of(arg, &ctx.env, &ctx.checked.sigs)?;
                 let av = gen_expr(ctx, arg)?;
-                lowered.push(format!("{} {}", llty(at), av));
+                // i16 args must carry signext at the call site too, matching
+                // the callee's def, or the AArch64/x86-64 ABI mismatches.
+                let ext = if at == Ty::I16 { "signext " } else { "" };
+                lowered.push(format!("{} {ext}{}", llty(at), av));
             }
             let dst = ctx.fresh();
+            let ret_ext = if ret == Ty::I16 { "signext " } else { "" };
             ctx.emit(format!(
-                "{dst} = call {} @{}({})",
+                "{dst} = call {ret_ext}{} @{}({})",
                 llty(ret),
                 name,
                 lowered.join(", ")

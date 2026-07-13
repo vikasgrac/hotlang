@@ -9,6 +9,8 @@ int main(void){
   CK(spread(10000,10002), 2);
   CK(spread(10002,10000), 0);          // crossed book -> 0
   CK(imbalance_bps(600,400), 2000);
+  CK(imbalance_bps(300000,0), 10000);   // large sizes: no i32 overflow/sign-flip
+  CK(imbalance_bps(0,250000), -10000);
   CK(imbalance_bps(0,0), 0);           // empty book -> 0, total
   CK(delta_ticks(60000123, 60000000), 123);
   CK(delta_ticks(59999900, 60000000), -100);
