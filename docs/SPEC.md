@@ -33,16 +33,30 @@ Whitespace is insignificant except as a token separator.
 
 ## 2. Types
 
-| Type        | Meaning                                             |
-|-------------|-----------------------------------------------------|
-| `i64`       | 64-bit signed integer, two's complement             |
-| `f64`       | IEEE-754 double                                      |
-| `bool`      | `true` / `false`                                    |
-| `[i64; N]`  | fixed-size array of `N` `i64`, **parameter only**   |
-| `[f64; N]`  | fixed-size array of `N` `f64`, **parameter only**   |
+| Type          | Meaning                                              |
+|---------------|------------------------------------------------------|
+| `i16`         | 16-bit signed integer, two's complement (the squeeze)|
+| `i32`         | 32-bit signed integer — holds any real price in ticks|
+| `i64`         | 64-bit signed integer                                |
+| `f64`         | IEEE-754 double                                      |
+| `bool`        | `true` / `false`                                     |
+| `[T; N]`      | fixed-size array of `N` `T` (`T` ∈ i16/i32/i64/f64), **parameter only** |
+| `ring[T; N]`  | circular buffer, `N` a power of two, **parameter only, mutable** |
 
 `N` is a positive integer literal — a compile-time constant. There are no
-implicit conversions between any two types. Arrays are not first-class
+implicit conversions between types; explicit conversions are the builtins
+`f64`, `i16`, `i32`, `i64` (§9).
+
+**Narrow integers** (`i16`/`i32`) are the bit-squeeze lever: half or a
+quarter the width of `f64`, so more values pack into each SIMD register and
+cache line. Integer literals infer the narrow type of the other operand in a
+binary op, if they provably fit (`price / 2` where `price: i32` compiles;
+`x + 40000` where `x: i16` is a compile error — the literal doesn't fit).
+
+**`ring`** is the tick-stream primitive: `push r, v` appends in O(1)
+(masked wrap), `r[k]` reads the k-th most recent element in-bounds by
+construction. See [DESIGN-builtins.md](DESIGN-builtins.md) and
+`examples/ring.hot`. Arrays are not first-class
 values: they may appear only as parameters, be indexed, and (if declared
 `mut`) be stored into. They cannot be bound with `let`, returned, or passed
 to another hotlang function (see §11).
