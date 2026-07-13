@@ -1,9 +1,10 @@
 //! hotc — the hotlang compiler.
 //!
 //! ```text
-//! hotc check <file.hot>            verify only (types + bounded-execution)
-//! hotc emit  <file.hot>            print LLVM IR to stdout
-//! hotc build <file.hot> [-o dir]   emit .ll, then clang -O3 → .s + .o + .dylib/.so
+//! hotc check   <file.hot>            verify only (types + bounded-execution)
+//! hotc emit    <file.hot>            print LLVM IR to stdout
+//! hotc build   <file.hot> [-o dir]   emit .ll, then clang -O3 → .s + .o + .dylib/.so
+//! hotc verilog <file.hot>            emit synthesizable Verilog (loop-free int fns → hardware)
 //! ```
 
 mod ast;
@@ -12,6 +13,7 @@ mod diag;
 mod lexer;
 mod parser;
 mod sema;
+mod verilog;
 
 use std::path::{Path, PathBuf};
 use std::process::{exit, Command};
@@ -19,7 +21,7 @@ use std::process::{exit, Command};
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
-        eprintln!("usage: hotc <check|emit|build> <file.hot> [-o outdir]");
+        eprintln!("usage: hotc <check|emit|build|verilog> <file.hot> [-o outdir]");
         exit(2);
     }
     let cmd = args[1].as_str();
@@ -37,6 +39,20 @@ fn main() {
             exit(2);
         }
     };
+
+    // verilog targets hardware, not LLVM — it needs the checked functions.
+    if cmd == "verilog" {
+        match verilog_of(&src, file) {
+            Ok(v) => {
+                print!("{v}");
+                return;
+            }
+            Err(d) => {
+                eprint!("{}", d.render(file, &src));
+                exit(1);
+            }
+        }
+    }
 
     let ir = match compile(&src, file) {
         Ok(ir) => ir,
@@ -63,10 +79,21 @@ fn main() {
             }
         }
         other => {
-            eprintln!("error: unknown command `{other}` (expected check, emit, or build)");
+            eprintln!("error: unknown command `{other}` (expected check, emit, build, or verilog)");
             exit(2);
         }
     }
+}
+
+fn verilog_of(src: &str, file: &str) -> Result<String, diag::Diag> {
+    let toks = lexer::lex(src)?;
+    let fns = parser::Parser::new(toks).parse_program()?;
+    sema::check(&fns)?;
+    let module = Path::new(file)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "module".to_string());
+    verilog::generate(&fns, &module)
 }
 
 fn compile(src: &str, file: &str) -> Result<String, diag::Diag> {

@@ -98,5 +98,19 @@ $HOTC build examples/narrow.hot -o "$OUT" > /dev/null
 clang -O2 tests/narrow_edge.c "$OUT/narrow.o" -o "$OUT/narrow_edge"
 "$OUT/narrow_edge"
 
+echo "== hotlang -> Verilog: generated hardware matches the CPU (if iverilog present) =="
+if command -v iverilog >/dev/null 2>&1; then
+    $HOTC verilog examples/narrow.hot > "$OUT/narrow.v"
+    iverilog -o "$OUT/hw_sim" "$OUT/narrow.v" tests/hw_tb.v >/dev/null
+    HW="$(vvp "$OUT/hw_sim" 2>/dev/null)"
+    if echo "$HW" | grep -q "ALL HARDWARE MATCHES"; then
+        echo "ok   generated Verilog simulates identically to the CPU"
+    else
+        echo "$HW"; echo "FAIL: hardware != CPU"; exit 1
+    fi
+else
+    echo "skip (iverilog not installed)"
+fi
+
 echo ""
 echo "ALL TESTS PASSED"
