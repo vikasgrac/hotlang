@@ -11,6 +11,9 @@ pub enum Elem {
     I16,
     I32,
     I64,
+    U16,
+    U32,
+    U64,
     F64,
 }
 
@@ -20,6 +23,9 @@ impl Elem {
             Elem::I16 => "i16",
             Elem::I32 => "i32",
             Elem::I64 => "i64",
+            Elem::U16 => "u16",
+            Elem::U32 => "u32",
+            Elem::U64 => "u64",
             Elem::F64 => "f64",
         }
     }
@@ -30,6 +36,9 @@ pub enum Ty {
     I16,
     I32,
     I64,
+    U16,
+    U32,
+    U64,
     F64,
     Bool,
     /// Fixed-size array, parameter-only in v0.2. `[f64; 256]`
@@ -47,6 +56,9 @@ impl Ty {
             Ty::I16 => "i16".to_string(),
             Ty::I32 => "i32".to_string(),
             Ty::I64 => "i64".to_string(),
+            Ty::U16 => "u16".to_string(),
+            Ty::U32 => "u32".to_string(),
+            Ty::U64 => "u64".to_string(),
             Ty::F64 => "f64".to_string(),
             Ty::Bool => "bool".to_string(),
             Ty::Arr(e, n) => format!("[{}; {}]", e.name(), n),
@@ -59,24 +71,33 @@ impl Ty {
             Elem::I16 => Ty::I16,
             Elem::I32 => Ty::I32,
             Elem::I64 => Ty::I64,
+            Elem::U16 => Ty::U16,
+            Elem::U32 => Ty::U32,
+            Elem::U64 => Ty::U64,
             Elem::F64 => Ty::F64,
         }
     }
 
-    /// Signed-integer bit width, or None for non-integer types. The engine
-    /// behind bit-squeezing: interval analysis proves a value fits, and the
-    /// narrowest width wins.
+    /// Integer bit width (signed or unsigned), or None for non-integer types.
     pub fn int_bits(&self) -> Option<u32> {
         match self {
-            Ty::I16 => Some(16),
-            Ty::I32 => Some(32),
-            Ty::I64 => Some(64),
+            Ty::I16 | Ty::U16 => Some(16),
+            Ty::I32 | Ty::U32 => Some(32),
+            Ty::I64 | Ty::U64 => Some(64),
             _ => None,
         }
     }
 
     pub fn is_int(&self) -> bool {
         self.int_bits().is_some()
+    }
+
+    /// Unsigned integer? Unsigned types carry a native [0, 2^n) range that
+    /// LLVM exploits — `u32 % 8` becomes a single `and`, no sign-correction,
+    /// no metadata, no UB. This is the type-safe way hotlang beats the tuned
+    /// C++ people ship (which carries prices as signed int).
+    pub fn is_unsigned(&self) -> bool {
+        matches!(self, Ty::U16 | Ty::U32 | Ty::U64)
     }
 }
 

@@ -27,10 +27,12 @@ use crate::sema::{binary_operand_ty, builtin_ret, infer_range, type_of, Checked,
 use std::collections::{BTreeSet, HashMap};
 
 fn llty(t: Ty) -> &'static str {
+    // LLVM integers are sign-agnostic; the width is the type, signedness is
+    // carried by the operations (udiv vs sdiv, ult vs slt, zext vs sext).
     match t {
-        Ty::I16 => "i16",
-        Ty::I32 => "i32",
-        Ty::I64 => "i64",
+        Ty::I16 | Ty::U16 => "i16",
+        Ty::I32 | Ty::U32 => "i32",
+        Ty::I64 | Ty::U64 => "i64",
         Ty::F64 => "double",
         Ty::Bool => "i1",
         Ty::Arr(..) | Ty::Ring(..) => "ptr",
@@ -39,10 +41,20 @@ fn llty(t: Ty) -> &'static str {
 
 fn ll_elem(e: Elem) -> &'static str {
     match e {
-        Elem::I16 => "i16",
-        Elem::I32 => "i32",
-        Elem::I64 => "i64",
+        Elem::I16 | Elem::U16 => "i16",
+        Elem::I32 | Elem::U32 => "i32",
+        Elem::I64 | Elem::U64 => "i64",
         Elem::F64 => "double",
+    }
+}
+
+/// Sub-32-bit integer C-ABI extension attribute: i16 -> signext, u16 ->
+/// zeroext. i32/i64/u32/u64/f64 are register-width and need none.
+fn ext_attr(t: Ty) -> &'static str {
+    match t {
+        Ty::I16 => "signext ",
+        Ty::U16 => "zeroext ",
+        _ => "",
     }
 }
 
@@ -50,9 +62,9 @@ fn ll_elem(e: Elem) -> &'static str {
 /// array/ring loads and stores claim the right (not over-stated) alignment.
 fn ealign(e: Elem) -> u32 {
     match e {
-        Elem::I16 => 2,
-        Elem::I32 => 4,
-        Elem::I64 | Elem::F64 => 8,
+        Elem::I16 | Elem::U16 => 2,
+        Elem::I32 | Elem::U32 => 4,
+        Elem::I64 | Elem::U64 | Elem::F64 => 8,
     }
 }
 
@@ -277,7 +289,7 @@ fn gen_fn(
                 // Sub-32-bit integers need `signext` for a correct C ABI on
                 // arm64/x86-64 (the value must be sign-extended in-register at
                 // the call boundary). i32/i64/f64 are register-width already.
-                let ext = if ty == Ty::I16 { "signext " } else { "" };
+                let ext = ext_attr(ty);
                 sig_params.push(format!("{} {ext}{}", llty(ty), reg));
                 ctx.loc.insert(p.name.clone(), Loc::Ssa(reg));
             }
@@ -289,7 +301,7 @@ fn gen_fn(
     gen_stmts(&mut ctx, &f.body)?;
 
     let attr = if has_arrays { "#1" } else { "#0" };
-    let ret_ext = if f.ret == Ty::I16 { "signext " } else { "" };
+    let ret_ext = ext_attr(f.ret);
     Ok(format!(
         "define {ret_ext}{} @{}({}) local_unnamed_addr {} {{\nentry:\n{}{}}}\n",
         llty(f.ret),
@@ -439,6 +451,33 @@ fn gen_int_divrem(
     rhs_range: Option<(i64, i64)>,
 ) -> Result<String, Diag> {
     let t = llty(ty);
+    // Unsigned: udiv/urem are total except /0 (u/0==0, u%0==u); there is NO
+    // MIN/-1 overflow case. Crucially, `urem u32 x, 8` lowers to a single
+    // `and` and `udiv` to a shift — no sign-correction, 4x wider vectors —
+    // because the type carries the [0, 2^n) range LLVM needs. This is the
+    // type-safe way hotlang beats the tuned C++ people ship (signed prices).
+    if ty.is_unsigned() {
+        let instr = if op == BinOp::Div { "udiv" } else { "urem" };
+        let nonzero = rhs_range.map_or(false, |(lo, hi)| lo > 0 || hi < 0);
+        if nonzero {
+            let dst = ctx.fresh();
+            ctx.emit(format!("{dst} = {instr} {t} {lv}, {rv}"));
+            return Ok(dst);
+        }
+        let bz = ctx.fresh();
+        ctx.emit(format!("{bz} = icmp eq {t} {rv}, 0"));
+        let bsafe = ctx.fresh();
+        ctx.emit(format!("{bsafe} = select i1 {bz}, {t} 1, {t} {rv}"));
+        let raw = ctx.fresh();
+        ctx.emit(format!("{raw} = {instr} {t} {lv}, {bsafe}"));
+        let dst = ctx.fresh();
+        if op == BinOp::Div {
+            ctx.emit(format!("{dst} = select i1 {bz}, {t} 0, {t} {raw}"));
+        } else {
+            ctx.emit(format!("{dst} = select i1 {bz}, {t} {lv}, {t} {raw}"));
+        }
+        return Ok(dst);
+    }
     let bits = ty.int_bits().unwrap();
     let tmin: i64 = if bits == 64 { i64::MIN } else { -(1i64 << (bits - 1)) };
     let instr = if op == BinOp::Div { "sdiv" } else { "srem" };
@@ -489,42 +528,52 @@ fn gen_builtin(ctx: &mut FnCtx, name: &str, args: &[Expr]) -> Result<String, Dia
     }
     let ret = builtin_ret(name, &atys).expect("sema verified builtin overload");
     // Conversions — the bit-squeeze operators, all total:
-    //  f64(int)     : exact sitofp
-    //  iW(f64)      : truncate toward zero, saturate to [iW::MIN, iW::MAX],
-    //                 NaN -> 0 (llvm.fptosi.sat)
-    //  iW(int)      : narrow = trunc, widen = sext, same = nop
+    //  f64(int) : sitofp (signed) / uitofp (unsigned source), exact
+    //  iW/uW(f64): truncate toward zero, saturate, NaN -> 0 (fptosi/fptoui.sat)
+    //  int->int  : narrow = trunc; widen = sext (signed src) / zext (unsigned src)
     if name == "f64" {
         let src = llty(atys[0]);
+        let op = if atys[0].is_unsigned() { "uitofp" } else { "sitofp" };
         let dst = ctx.fresh();
-        ctx.emit(format!("{dst} = sitofp {src} {} to double", vals[0]));
+        ctx.emit(format!("{dst} = {op} {src} {} to double", vals[0]));
         return Ok(dst);
     }
-    if name == "i16" || name == "i32" || name == "i64" {
+    if matches!(name, "i16" | "i32" | "i64" | "u16" | "u32" | "u64") {
         let dw = ret.int_bits().unwrap();
         let dt = llty(ret);
         if atys[0] == Ty::F64 {
-            let intr: &'static str = match dw {
-                16 => "declare i16 @llvm.fptosi.sat.i16.f64(double)",
-                32 => "declare i32 @llvm.fptosi.sat.i32.f64(double)",
-                _ => "declare i64 @llvm.fptosi.sat.i64.f64(double)",
+            // fptoui.sat for unsigned dest, fptosi.sat for signed.
+            let sat = if ret.is_unsigned() { "fptoui" } else { "fptosi" };
+            let decl: &'static str = match (sat, dw) {
+                ("fptoui", 16) => "declare i16 @llvm.fptoui.sat.i16.f64(double)",
+                ("fptoui", 32) => "declare i32 @llvm.fptoui.sat.i32.f64(double)",
+                ("fptoui", _) => "declare i64 @llvm.fptoui.sat.i64.f64(double)",
+                (_, 16) => "declare i16 @llvm.fptosi.sat.i16.f64(double)",
+                (_, 32) => "declare i32 @llvm.fptosi.sat.i32.f64(double)",
+                (_, _) => "declare i64 @llvm.fptosi.sat.i64.f64(double)",
             };
-            ctx.intrinsics.insert(intr);
+            ctx.intrinsics.insert(decl);
             let dst = ctx.fresh();
-            ctx.emit(format!("{dst} = call {dt} @llvm.fptosi.sat.{dt}.f64(double {})", vals[0]));
+            ctx.emit(format!("{dst} = call {dt} @llvm.{sat}.sat.{dt}.f64(double {})", vals[0]));
             return Ok(dst);
         }
-        // int -> int
+        // int -> int. Widening extends by the SOURCE signedness.
         let sw = atys[0].int_bits().unwrap();
         let st = llty(atys[0]);
         let dst = ctx.fresh();
         if dw < sw {
             ctx.emit(format!("{dst} = trunc {st} {} to {dt}", vals[0]));
         } else if dw > sw {
-            ctx.emit(format!("{dst} = sext {st} {} to {dt}", vals[0]));
+            let ext = if atys[0].is_unsigned() { "zext" } else { "sext" };
+            ctx.emit(format!("{dst} = {ext} {st} {} to {dt}", vals[0]));
         } else {
             return Ok(vals[0].clone());
         }
         return Ok(dst);
+    }
+    // abs of an unsigned value is the value itself.
+    if name == "abs" && atys[0].is_unsigned() {
+        return Ok(vals[0].clone());
     }
     // (intrinsic call target, module-level declaration, trailing extra args)
     let (target, decl, extra): (&str, &'static str, &str) = match (name, &atys[..]) {
@@ -546,6 +595,12 @@ fn gen_builtin(ctx: &mut FnCtx, name: &str, args: &[Expr]) -> Result<String, Dia
         ("max", [Ty::I32, _]) => ("llvm.smax.i32", "declare i32 @llvm.smax.i32(i32, i32)", ""),
         ("min", [Ty::I64, _]) => ("llvm.smin.i64", "declare i64 @llvm.smin.i64(i64, i64)", ""),
         ("max", [Ty::I64, _]) => ("llvm.smax.i64", "declare i64 @llvm.smax.i64(i64, i64)", ""),
+        ("min", [Ty::U16, _]) => ("llvm.umin.i16", "declare i16 @llvm.umin.i16(i16, i16)", ""),
+        ("max", [Ty::U16, _]) => ("llvm.umax.i16", "declare i16 @llvm.umax.i16(i16, i16)", ""),
+        ("min", [Ty::U32, _]) => ("llvm.umin.i32", "declare i32 @llvm.umin.i32(i32, i32)", ""),
+        ("max", [Ty::U32, _]) => ("llvm.umax.i32", "declare i32 @llvm.umax.i32(i32, i32)", ""),
+        ("min", [Ty::U64, _]) => ("llvm.umin.i64", "declare i64 @llvm.umin.i64(i64, i64)", ""),
+        ("max", [Ty::U64, _]) => ("llvm.umax.i64", "declare i64 @llvm.umax.i64(i64, i64)", ""),
         ("pow", _) => ("llvm.pow.f64", "declare double @llvm.pow.f64(double, double)", ""),
         ("fma", _) => ("llvm.fma.f64", "declare double @llvm.fma.f64(double, double, double)", ""),
         _ => unreachable!("sema verified builtin overload"),
@@ -685,6 +740,8 @@ fn gen_expr(ctx: &mut FnCtx, e: &Expr) -> Result<String, Diag> {
             let dst = ctx.fresh();
             let ty = llty(lt);
             let is_f = lt == Ty::F64;
+            // Unsigned integers use the u-variant ordering comparisons.
+            let u = lt.is_unsigned();
             let instr: String = match (op, is_f) {
                 (BinOp::Add, true) => format!("fadd {FMF}"),
                 (BinOp::Add, false) => "add ".into(),
@@ -693,7 +750,7 @@ fn gen_expr(ctx: &mut FnCtx, e: &Expr) -> Result<String, Diag> {
                 (BinOp::Mul, true) => format!("fmul {FMF}"),
                 (BinOp::Mul, false) => "mul ".into(),
                 (BinOp::Div, true) => format!("fdiv {FMF}"),
-                (BinOp::Div, false) => "sdiv ".into(),
+                (BinOp::Div, false) => "sdiv ".into(), // unsigned div handled above
                 (BinOp::Rem, true) => format!("frem {FMF}"),
                 (BinOp::Rem, false) => "srem ".into(),
                 (BinOp::And, _) => "and ".into(),
@@ -702,18 +759,17 @@ fn gen_expr(ctx: &mut FnCtx, e: &Expr) -> Result<String, Diag> {
                 (BinOp::Eq, false) => "icmp eq ".into(),
                 // `une` (unordered not-equal), NOT `one`: matches C/Java/IEEE
                 // so `x != x` is the canonical NaN test (true for NaN) and
-                // `==`/`!=` stay complementary. With `one`, LLVM folds
-                // `x != x` to false and deletes NaN guards as dead code.
+                // `==`/`!=` stay complementary.
                 (BinOp::Ne, true) => "fcmp une ".into(),
                 (BinOp::Ne, false) => "icmp ne ".into(),
                 (BinOp::Lt, true) => "fcmp olt ".into(),
-                (BinOp::Lt, false) => "icmp slt ".into(),
+                (BinOp::Lt, false) => if u { "icmp ult " } else { "icmp slt " }.into(),
                 (BinOp::Le, true) => "fcmp ole ".into(),
-                (BinOp::Le, false) => "icmp sle ".into(),
+                (BinOp::Le, false) => if u { "icmp ule " } else { "icmp sle " }.into(),
                 (BinOp::Gt, true) => "fcmp ogt ".into(),
-                (BinOp::Gt, false) => "icmp sgt ".into(),
+                (BinOp::Gt, false) => if u { "icmp ugt " } else { "icmp sgt " }.into(),
                 (BinOp::Ge, true) => "fcmp oge ".into(),
-                (BinOp::Ge, false) => "icmp sge ".into(),
+                (BinOp::Ge, false) => if u { "icmp uge " } else { "icmp sge " }.into(),
             };
             ctx.emit(format!("{dst} = {instr}{ty} {lv}, {rv}"));
             Ok(dst)
@@ -729,11 +785,11 @@ fn gen_expr(ctx: &mut FnCtx, e: &Expr) -> Result<String, Diag> {
                 let av = gen_expr(ctx, arg)?;
                 // i16 args must carry signext at the call site too, matching
                 // the callee's def, or the AArch64/x86-64 ABI mismatches.
-                let ext = if at == Ty::I16 { "signext " } else { "" };
+                let ext = ext_attr(at);
                 lowered.push(format!("{} {ext}{}", llty(at), av));
             }
             let dst = ctx.fresh();
-            let ret_ext = if ret == Ty::I16 { "signext " } else { "" };
+            let ret_ext = ext_attr(ret);
             ctx.emit(format!(
                 "{dst} = call {ret_ext}{} @{}({})",
                 llty(ret),

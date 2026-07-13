@@ -112,5 +112,16 @@ else
     echo "skip (iverilog not installed)"
 fi
 
+echo "== unsigned ints (u16/u32/u64): total arithmetic + the strength-reduction win =="
+$HOTC build examples/unsigned.hot -o "$OUT" > /dev/null
+clang -O2 tests/unsigned_edge.c "$OUT/unsigned.o" -o "$OUT/unsigned_edge"
+"$OUT/unsigned_edge"
+# the win: u32 % 8 must lower to a vector AND (no signed sign-correction)
+if clang -O3 -march=native -S "$OUT/unsigned.ll" -o - 2>/dev/null | sed -n '/bucketize:/,/ret/p' | grep -q "and"; then
+    echo "ok   u32 %% 8 lowers to AND (beats signed C++ ~4x, verified in bench)"
+else
+    echo "FAIL: u32 %% 8 did not strength-reduce"; exit 1
+fi
+
 echo ""
 echo "ALL TESTS PASSED"

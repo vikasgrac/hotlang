@@ -49,7 +49,7 @@ const RESERVED_SYMBOLS: &[&str] = &[
 /// prices are doubles — `f64(qty) * px` is line one of real HFT code).
 const BUILTIN_NAMES: &[&str] = &[
     "sqrt", "abs", "min", "max", "fma", "floor", "ceil", "exp", "log", "pow", "f64", "i64", "i32",
-    "i16",
+    "i16", "u64", "u32", "u16",
 ];
 
 pub fn is_builtin(name: &str) -> bool {
@@ -72,6 +72,9 @@ pub fn builtin_ret(name: &str, args: &[Ty]) -> Option<Ty> {
         ("i16", [a]) if a.is_int() || *a == Ty::F64 => Some(Ty::I16),
         ("i32", [a]) if a.is_int() || *a == Ty::F64 => Some(Ty::I32),
         ("i64", [a]) if a.is_int() || *a == Ty::F64 => Some(Ty::I64),
+        ("u16", [a]) if a.is_int() || *a == Ty::F64 => Some(Ty::U16),
+        ("u32", [a]) if a.is_int() || *a == Ty::F64 => Some(Ty::U32),
+        ("u64", [a]) if a.is_int() || *a == Ty::F64 => Some(Ty::U64),
         _ => None,
     }
 }
@@ -458,6 +461,9 @@ fn lit_fits(n: i64, ty: Ty) -> bool {
         Ty::I16 => (-32768..=32767).contains(&n),
         Ty::I32 => n >= i32::MIN as i64 && n <= i32::MAX as i64,
         Ty::I64 => true,
+        Ty::U16 => (0..=65535).contains(&n),
+        Ty::U32 => n >= 0 && n <= u32::MAX as i64,
+        Ty::U64 => n >= 0, // any non-negative i64 literal fits u64
         _ => false,
     }
 }

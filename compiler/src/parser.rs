@@ -95,6 +95,9 @@ impl Parser {
                 "i16" => Elem::I16,
                 "i32" => Elem::I32,
                 "i64" => Elem::I64,
+                "u16" => Elem::U16,
+                "u32" => Elem::U32,
+                "u64" => Elem::U64,
                 "f64" => Elem::F64,
                 other => {
                     return Err(Diag::new(
@@ -141,6 +144,9 @@ impl Parser {
                 "i16" => Elem::I16,
                 "i32" => Elem::I32,
                 "i64" => Elem::I64,
+                "u16" => Elem::U16,
+                "u32" => Elem::U32,
+                "u64" => Elem::U64,
                 "f64" => Elem::F64,
                 other => {
                     return Err(Diag::new(
@@ -175,6 +181,9 @@ impl Parser {
             "i16" => Ok(Ty::I16),
             "i32" => Ok(Ty::I32),
             "i64" => Ok(Ty::I64),
+            "u16" => Ok(Ty::U16),
+            "u32" => Ok(Ty::U32),
+            "u64" => Ok(Ty::U64),
             "f64" => Ok(Ty::F64),
             "bool" => Ok(Ty::Bool),
             other => Err(Diag::new(
