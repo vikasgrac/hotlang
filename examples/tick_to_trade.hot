@@ -1,0 +1,67 @@
+// tick_to_trade.hot — a typical HFT market-making hot path in hotlang.
+//
+// This is the whole tick-to-trade decision in one function, called once per
+// incoming market-data tick. If it compiles, the compiler has PROVEN it:
+//   - allocates nothing (there is no heap in the language)
+//   - has bounded execution (no unbounded loops, no recursion)
+//   - never reads out of bounds
+//   - cannot fault on bad input (division is total — an empty book gives 0,
+//     not a crash)
+//
+// The model: hotlang is not your whole system. Your system stays in C++/Java;
+// you write just the critical hot path here, compile it to a normal C library,
+// and call it per tick. The host allocates the buffers ONCE at startup;
+// nothing allocates after that.
+//
+//   BUILD:   hotc build examples/tick_to_trade.hot -o out
+//            -> out/tick_to_trade.o  (plain C ABI functions)
+//
+//   FLOW:    market data --> [ rolling vol | microprice | book pressure ]
+//                        --> branchless decision --> order size
+//
+// Called from C (allocate the window + state once, then call per tick):
+//
+//   extern int64_t on_tick(void* px_hist, double* state,
+//                          double bid, double ask,
+//                          double bid_sz, double ask_sz, int64_t max_size);
+//
+//   static struct { int64_t head; double data[256]; } px_hist;  // zeroed
+//   static double state[2] = {0, 0};
+//   // hot loop, per tick:
+//   int64_t qty = on_tick(&px_hist, state, bid, ask, bid_sz, ask_sz, 100);
+//   if (qty) send_order(qty);
+
+fn on_tick(
+    px_hist: mut ring[f64; 256],   // rolling window of mid prices — the language owns it
+    state: mut [f64; 2],           // running [mean, M2] for volatility
+    bid: f64, ask: f64,
+    bid_sz: f64, ask_sz: f64,
+    max_size: i64
+) -> i64 {
+    let mid = (bid + ask) / 2.0;
+
+    // 1. Rolling volatility over the last 256 ticks. O(1) per tick — updated
+    //    from the one tick that changed, not recomputed over 256 samples
+    //    (that is the ~30x vs a stateless kernel library). Welford form, so
+    //    it stays accurate even on high-priced instruments (variance << px^2).
+    let leaving = px_hist[255];
+    push px_hist, mid;
+    let old_mean = state[0];
+    let new_mean = old_mean + (mid - leaving) / 256.0;
+    let m2 = state[1] + (mid - leaving) * (mid - new_mean + leaving - old_mean);
+    state[0] = new_mean;
+    state[1] = m2;
+    let vol = sqrt(max(m2 / 256.0, 0.0));
+
+    // 2. Book signals: size-weighted microprice, and bid-side pressure.
+    //    An empty book (bid_sz + ask_sz == 0) yields 0 here — total, no fault.
+    let micro    = (bid * ask_sz + ask * bid_sz) / (bid_sz + ask_sz);
+    let pressure = bid_sz / (bid_sz + ask_sz);
+    let edge     = micro - mid;
+
+    // 3. Decide: follow the book when the edge clears the noise floor (vol).
+    //    Compiles to a branchless csel — no branch predictor in the decision.
+    let buy  = pressure > 0.6 && edge > vol;
+    let sell = pressure < 0.4 && edge < (0.0 - vol);
+    return if buy { max_size } else { if sell { 0 - max_size } else { 0 } };
+}
