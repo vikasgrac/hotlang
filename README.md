@@ -459,6 +459,9 @@ lived in the compiler instead of code review?" It is not production
 software and ships with no support SLA. Issues and PRs are welcome;
 response times follow a side-project cadence.
 
+Co-authored with Claude Fable 5 (Anthropic). The human had the ideas and the taste; 
+the AI had infinite patience and wrote most of the parser.
+
 Licensed under [Apache-2.0](LICENSE). Built with AI assistance (Anthropic
 Claude) under human direction — including the adversarial review panels
 that falsified this README's original headline claim and forced the honest
