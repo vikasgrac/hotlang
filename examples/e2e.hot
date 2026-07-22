@@ -1,0 +1,69 @@
+// e2e.hot — the full simulated hot path for the end-to-end latency test
+// (bench/e2e.sh). One verified function, called once per tick by the host:
+//
+//   depth-book reductions (pressure, vwap)   <- "market book operation"
+//   + O(1) rolling volatility over 256 mids  <- incremental streaming state
+//   + microprice / edge signal               <- representative strategy
+//   -> branchless decision                   -> signed order qty to the host
+//
+// If it compiles, the compiler has proven: no allocation, bounded execution,
+// every access in-bounds, all arithmetic total (an empty book yields 0 edge
+// and 0 pressure, never a fault).
+//
+// Host contract (allocate once at startup, reuse every tick):
+//   static struct { int64_t head; double data[256]; } ret_hist;  // zeroed
+//   static double state[3] = {0, 0, 0};        // [mean, M2, prev_mid]
+//   int64_t qty = on_tick(&ret_hist, state, bid_px, bid_qty, ask_px, ask_qty, 100);
+
+fn on_tick(
+    ret_hist: mut ring[f64; 256],  // rolling window of per-tick RETURNS
+    state: mut [f64; 3],           // running [mean, M2, prev_mid]
+    bid_px:  [f64; 32], bid_qty: [f64; 32],   // bid depth (level 0 = top)
+    ask_px:  [f64; 32], ask_qty: [f64; 32],   // ask depth
+    max_size: i64
+) -> i64 {
+    // 1. Book operation: one fused pass over 32 levels per side.
+    //    Pressure and vwap share the loop; intermediates stay in registers.
+    let mut bsum = 0.0;
+    let mut asum = 0.0;
+    let mut bnot = 0.0;
+    let mut anot = 0.0;
+    for i in 0..32 {
+        bsum = bsum + bid_qty[i];
+        asum = asum + ask_qty[i];
+        bnot = bnot + bid_px[i] * bid_qty[i];
+        anot = anot + ask_px[i] * ask_qty[i];
+    }
+    let depth    = bsum + asum;
+    let pressure = bsum / depth;              // total: empty book -> 0
+    let vwap     = (bnot + anot) / depth;
+
+    let top_bid = bid_px[0];
+    let top_ask = ask_px[0];
+    let mid     = (top_bid + top_ask) / 2.0;
+
+    // 2. Rolling volatility of per-tick RETURNS over the last 256 ticks —
+    //    the noise floor a short-horizon strategy actually compares against.
+    //    O(1) per tick (Welford form): updated from the one sample that
+    //    changed, not recomputed over the window.
+    let ret      = mid - state[2];             // first tick: mid - 0, flushed
+    state[2]     = mid;                        //   out of the window in 256 ticks
+    let leaving  = ret_hist[255];
+    push ret_hist, ret;
+    let old_mean = state[0];
+    let new_mean = old_mean + (ret - leaving) / 256.0;
+    let m2 = state[1] + (ret - leaving) * (ret - new_mean + leaving - old_mean);
+    state[0] = new_mean;
+    state[1] = m2;
+    let vol = sqrt(max(m2 / 256.0, 0.0));
+
+    // 3. Strategy: microprice skew + vwap skew vs the volatility noise floor.
+    let micro = (top_bid * ask_qty[0] + top_ask * bid_qty[0])
+              / (bid_qty[0] + ask_qty[0]);
+    let edge  = (micro - mid) + (vwap - mid) * 0.25;
+
+    // 4. Decide — compiles to branchless selects; no branch predictor here.
+    let buy  = pressure > 0.55 && edge > vol;
+    let sell = pressure < 0.45 && edge < (0.0 - vol);
+    return if buy { max_size } else { if sell { 0 - max_size } else { 0 } };
+}
