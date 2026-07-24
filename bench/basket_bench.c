@@ -18,7 +18,9 @@ extern double basket_arb      (const double*,const double*,const double*,double,
 extern double basket_c        (const double*,const double*,const double*,double,double*);
 extern double basket_c_tuned  (const double*,const double*,const double*,double,double*);
 extern double basket_cpp_tuned(const double*,const double*,const double*,double,double*);
+#ifdef HAVE_RUST
 extern double basket_rust     (const double*,const double*,const double*,double,double*);
+#endif
 #ifdef HAVE_ZIG
 extern double basket_zig      (const double*,const double*,const double*,double,double*);
 #endif
@@ -47,7 +49,10 @@ int main(void){
 
     struct{const char*n;fn f;int tuned;}C[]={
         {"hotlang",basket_arb,1},{"C plain",basket_c,0},{"C tuned",basket_c_tuned,1},
-        {"C++ tuned",basket_cpp_tuned,1},{"Rust",basket_rust,0},
+        {"C++ tuned",basket_cpp_tuned,1},
+#ifdef HAVE_RUST
+        {"Rust",basket_rust,0},
+#endif
 #ifdef HAVE_ZIG
         {"Zig tuned",basket_zig,1},
 #endif
